@@ -1,0 +1,4 @@
+.adversarial-loop/
+.adversarial-spec/
+__pycache__/
+.pytest_cache/
