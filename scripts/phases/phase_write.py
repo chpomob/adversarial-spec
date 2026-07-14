@@ -52,7 +52,7 @@ def run_write(brief_text, dev_cmd, workdir, timeout, feature, run=None):
         if not ok:
             return {
                 "phase": "write",
-                "exit_code": 1,
+                "exit_code": 2,
                 "error": f"spec validation failed: {err}",
                 "stdout": stdout,
             }

@@ -106,7 +106,7 @@ def test_write_dev_failure(git_repo):
 def test_write_missing_spec_fails_validation(git_repo):
     run = fake_run(stdout="did nothing")
     result = phase_write.run_write("brief", "dev", str(git_repo), 60, "f", run=run)
-    assert result["exit_code"] == 1
+    assert result["exit_code"] == 2
     assert "spec validation failed" in result["error"]
 
 
@@ -168,9 +168,14 @@ def test_challenge_rejects_bad_severity(tmp_path):
 def test_challenge_spec_embedded_in_prompt(tmp_path):
     (tmp_path / "spec.md").write_text(VALID_SPEC)
     calls = []
-    phase_challenge.run_challenge("rev", str(tmp_path), 60,
-                                  run=fake_run(stdout=CHALLENGE_OK, calls=calls))
+    branch_point = "0123456789abcdef"
+    phase_challenge.run_challenge(
+        "rev", str(tmp_path), 60,
+        run=fake_run(stdout=CHALLENGE_OK, calls=calls),
+        branch_point=branch_point)
     assert "demo-feature" in calls[0]["prompt"]
+    assert branch_point in calls[0]["prompt"]
+    assert "HEAD~1" not in calls[0]["prompt"]
     assert calls[0]["role"] == "spec-challenger"
 
 
@@ -222,6 +227,18 @@ def test_verify_parses_results(tmp_path):
     assert result["results"][0]["status"] == "resolved"
 
 
+def test_verify_prompt_uses_branch_point(tmp_path):
+    (tmp_path / "spec.md").write_text(VALID_SPEC)
+    calls = []
+    branch_point = "fedcba9876543210"
+    phase_verify.run_verify(
+        [{"id": "S1"}], "rev", str(tmp_path), 60,
+        run=fake_run(stdout=VERIFY_OK, calls=calls),
+        branch_point=branch_point)
+    assert branch_point in calls[0]["prompt"]
+    assert "HEAD~1" not in calls[0]["prompt"]
+
+
 def test_verify_invalid_status_rejected(tmp_path):
     (tmp_path / "spec.md").write_text(VALID_SPEC)
     bad = json.dumps({"results": [{"id": "S1", "status": "maybe"}],
@@ -257,3 +274,25 @@ def test_resolve_persona_falls_back_to_base_for_pi():
 
 def test_resolve_persona_unknown_role_is_none():
     assert phases.resolve_persona("no-such-role", "somecli") is None
+
+
+def test_validate_spec_requires_all_frontmatter_fields():
+    invalid = VALID_SPEC.replace('version: "1.0"\n', "")
+    ok, error = phases.validate_spec_text(invalid)
+    assert not ok
+    assert "version" in error
+
+
+def test_validate_spec_requires_requirement_criterion_coverage():
+    invalid = VALID_SPEC.replace("(R1)", "(R2)")
+    ok, error = phases.validate_spec_text(invalid)
+    assert not ok
+    assert "unknown requirements" in error
+
+
+def test_empty_spec_validator_exits_usage(tmp_path):
+    from scripts.phases import phase_spec
+
+    path = tmp_path / "spec.md"
+    path.write_text("")
+    assert phase_spec.main([str(path)]) == 2

@@ -43,6 +43,24 @@ def test_positive_int_rejects_zero_and_garbage():
     assert orch._positive_int("3") == 3
 
 
+def test_finish_merge_failure_returns_infra_and_records_error(
+        tmp_path, monkeypatch):
+    def fail_merge(*_args, **_kwargs):
+        raise orch.gitops.GitError("squash merge spec/demo/1 -> main failed: conflict")
+
+    monkeypatch.setattr(orch.gitops, "squash_merge", fail_merge)
+    args = orch.build_parser().parse_args([])
+    state = {"branch": "spec/demo/1", "parent_branch": "main"}
+
+    code = orch._finish(args, str(tmp_path), "demo", tmp_path, state,
+                        "APPROVED")
+
+    assert code == orch.EXIT_INFRA
+    final = json.loads((tmp_path / "final.json").read_text())
+    assert final["merged"] is False
+    assert "squash merge" in final["error"]
+
+
 # --- CLI parsing ------------------------------------------------------------------
 
 def test_parser_defaults():

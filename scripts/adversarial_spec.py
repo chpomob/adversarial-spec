@@ -134,8 +134,11 @@ def _restore(workdir, state):
 
 # --- PHASE 0: git setup / finalize ---------------------------------------------
 
-def _setup_git(workdir, feature):
+def _setup_git(workdir, feature, state=None):
     """Branch `spec/<feature>/<N>`, stash dirty, record branch-point, gitignore."""
+    state = state if state is not None else {}
+    # Establish the recovery slot before setup performs any git mutation.
+    state.setdefault("stash_id", "")
     try:
         if gitops.detect_enclosing_repo(workdir):
             gitops.ensure_git_identity(workdir)
@@ -143,13 +146,16 @@ def _setup_git(workdir, feature):
         else:
             gitops.auto_init(workdir)  # pins the initial branch to main
             parent = "main"
-        stash_id = gitops.stash_dirty(workdir)
+        state["parent_branch"] = parent
+        state["stash_id"] = gitops.stash_dirty(workdir)
         branch = gitops.create_loop_branch(workdir, feature, parent, prefix="spec")
+        state["branch"] = branch
         gitops.checkout(workdir, branch)
         branch_point = gitops.record_branch_point(workdir, parent)
+        state["branch_point"] = branch_point
         gitops.ensure_gitignore(workdir, ".adversarial-spec/")
         return {"exit_code": 0, "parent_branch": parent, "branch": branch,
-                "branch_point": branch_point, "stash_id": stash_id}
+                "branch_point": branch_point, "stash_id": state["stash_id"]}
     except Exception as exc:
         return {"exit_code": 1, "error": str(exc)}
 
@@ -183,9 +189,7 @@ def _finish(args, workdir, feature, out_dir, state, verdict, reason="", loops=0)
         else:
             gitops.reject_marker(workdir, f"{feature} — spec {verdict}")
     except gitops.GitError as exc:
-        # The verdict stands even when git finalize fails; final.json records
-        # merged=false + the error so the caller can inspect and retry.
-        error = str(exc)
+        error = f"git finalize failed: {exc}"
         print(f"X git finalize failed ({verdict}): {exc}")
     jsonio.write_final_json(
         out_dir, verdict,
@@ -196,6 +200,8 @@ def _finish(args, workdir, feature, out_dir, state, verdict, reason="", loops=0)
         artifacts_dir=str(out_dir),
     )
     print(f"\n{verdict}" + (f" — {reason}" if reason else ""))
+    if error:
+        return EXIT_INFRA
     return EXIT_APPROVED if verdict == "APPROVED" else EXIT_REJECTED
 
 
@@ -205,11 +211,11 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
               brief_text, state):
     """Run the full workflow. Returns the process exit code."""
     # PHASE 0 — GIT SETUP
-    setup = _setup_git(workdir, feature)
+    setup = _setup_git(workdir, feature, state)
+    state.update(setup)
     if setup["exit_code"] != 0:
         print(f"X git setup failed: {setup.get('error', 'unknown error')}")
         return EXIT_INFRA
-    state.update(setup)
     state["feature"] = feature
     _banner(f"SPEC BRANCH  {setup['branch']}  (from {setup['parent_branch']})")
     jsonio.save_artifact(out_dir, "00_brief.txt", brief_text)
@@ -220,12 +226,17 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
                                   args.timeout, feature)
     _write_json(out_dir, "01_write.json", write)
     if write["exit_code"] != 0:
+        if write.get("exit_code") == EXIT_USAGE:
+            print(f"X spec validation failed: {write.get('error', 'invalid spec')}")
+            return EXIT_USAGE
         return _phase_failed("write", write, state, out_dir)
     print(f"  OK commit {write.get('commit_sha', '')[:12]}")
 
     # PHASE 2 — CHALLENGE
     _banner("CHALLENGE  (SPEC-CHALLENGER)")
-    challenge = phase_challenge.run_challenge(review_cmd, workdir, args.timeout)
+    challenge = phase_challenge.run_challenge(
+        review_cmd, workdir, args.timeout,
+        branch_point=state["branch_point"])
     _write_json(out_dir, "02_challenge.json", challenge)
     if challenge["exit_code"] != 0:
         return _phase_failed("challenge", challenge, state, out_dir)
@@ -250,8 +261,9 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
             return _phase_failed(f"revise_{n}", revise, state, out_dir)
 
         _banner(f"VERIFY  (round {n}/{args.max_loops})")
-        verify = phase_verify.run_verify(findings, review_cmd, workdir,
-                                         args.timeout)
+        verify = phase_verify.run_verify(
+            findings, review_cmd, workdir, args.timeout,
+            branch_point=state["branch_point"])
         _write_json(out_dir, f"04_verify_{n}.json", verify)
         if verify["exit_code"] != 0:
             return _phase_failed(f"verify_{n}", verify, state, out_dir)

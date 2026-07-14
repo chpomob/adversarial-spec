@@ -33,7 +33,7 @@ def _validate(payload):
     return True
 
 
-def run_verify(findings, review_cmd, workdir, timeout, run=None):
+def run_verify(findings, review_cmd, workdir, timeout, run=None, branch_point=""):
     """
     Run the spec-challenger in VERIFY mode against the revised spec.
 
@@ -48,12 +48,14 @@ def run_verify(findings, review_cmd, workdir, timeout, run=None):
         return {"phase": "verify", "exit_code": 1,
                 "error": f"could not read spec.md: {exc}"}
 
+    diff_base = branch_point or "<branch-point>"
     prompt = (
         "The specification `spec.md` was revised to address the findings "
         "below. For each finding, decide whether it is **resolved** (the spec "
         "now addresses it), **rejected** (the finding was wrong), or "
         "**disputed** (still open / unclear). You may also run "
-        "`git diff HEAD~1..HEAD` in the current directory to see the exact "
+        "the cumulative diff in the current directory with "
+        f"`git diff {diff_base}..HEAD` to see the exact "
         "revision.\n\n"
         f"Findings:\n{json.dumps(findings, indent=2)}\n\n"
         "Output ONLY valid JSON:\n"
