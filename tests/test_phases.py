@@ -382,3 +382,90 @@ def test_verify_phase_defaults_without_round(tmp_path):
     phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
                             run=fake_run(stdout=VERIFY_OK, calls=calls))
     assert calls[0]["phase"] == "verify"
+
+
+# --- R2: required-section context refusal via check_context --------------------
+
+def test_check_context_refuses_missing_required_section():
+    from adversarial_common import gates
+    # This text has headings that don't contain "Requirements" at all.
+    brief = "## Background\n\nSome context here.\n\n## Summary\n\nAll done."
+    result = gates.check_context(
+        "brief", brief,
+        thresholds={"required_sections": ["Requirements"]})
+    assert result["ok"] is False
+    assert "Requirements" in result["reason"]
+
+
+def test_check_context_passes_with_required_section():
+    from adversarial_common import gates
+    brief = "## Problem\n\nSomething needs solving.\n\n## Requirements\n- R1"
+    result = gates.check_context(
+        "brief", brief,
+        thresholds={"required_sections": ["Requirements"]})
+    assert result["ok"] is True
+
+
+def test_check_context_refuses_empty_input():
+    from adversarial_common import gates
+    result = gates.check_context("brief", "   ")
+    assert result["ok"] is False
+    assert result["reason"] == "empty_input"
+
+
+# --- R8: epistemic normalization on challenge findings -------------------------
+
+def test_normalize_findings_defaults_missing_confidence_basis():
+    from adversarial_common import jsonio
+    findings = [{"id": "F1", "summary": "needs more detail"}]
+    payload = {"findings": findings}
+    warnings = []
+    jsonio.normalize_findings(payload, warnings=warnings)
+    assert findings[0]["confidence"] == "low"
+    assert findings[0]["basis"] == "inference"
+    assert any(w["code"] == "epistemic_label_defaulted" for w in warnings)
+
+
+def test_normalize_findings_preserves_valid_labels():
+    from adversarial_common import jsonio
+    findings = [{"id": "F1", "confidence": "high", "basis": "spec",
+                  "summary": "ok"}]
+    payload = {"findings": findings}
+    warnings = []
+    jsonio.normalize_findings(payload, warnings=warnings)
+    assert findings[0]["confidence"] == "high"
+    assert findings[0]["basis"] == "spec"
+    assert len(warnings) == 0
+
+
+def test_epistemic_distribution_counts_labels():
+    from adversarial_common import jsonio
+    findings = [
+        {"confidence": "high", "basis": "spec"},
+        {"confidence": "low", "basis": "inference"},
+        {"confidence": "high", "basis": "code"},
+    ]
+    dist = jsonio.epistemic_distribution(findings)
+    assert dist["confidence"]["high"] == 2
+    assert dist["confidence"]["low"] == 1
+    assert dist["basis"]["spec"] == 1
+    assert dist["basis"]["code"] == 1
+    assert dist["combined"]["high/spec"] == 1
+
+
+# --- R4: complexity estimate integration ---------------------------------------
+
+def test_estimate_complexity_levels():
+    from adversarial_common import gates
+    trivial = gates.estimate_complexity("x" * 50)
+    assert trivial["level"] == "trivial"
+    assert trivial["recommended_agents"] == 1
+    low = gates.estimate_complexity("x" * 2000 + "\nR1: something\n" * 3)
+    assert low["level"] == "low"
+    assert low["recommended_agents"] == 2
+    medium = gates.estimate_complexity("x" * 6000 + "\nR1: requirement\n" * 10)
+    assert medium["level"] == "medium"
+    assert medium["recommended_agents"] == 4
+    high = gates.estimate_complexity("x" * 10000 + "\nR1: req\n" * 50)
+    assert high["level"] == "high"
+    assert high["recommended_agents"] == 6

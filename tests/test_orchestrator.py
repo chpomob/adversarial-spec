@@ -242,3 +242,117 @@ def test_pipeline_restores_dirty_workdir(tmp_path):
     ])
     assert code == orch.EXIT_APPROVED
     assert (workdir / "wip.txt").read_text() == "uncommitted work"
+
+
+# --- R1: context gate blocks brief before any provider call -----------------
+
+def test_context_gate_blocks_short_brief(tmp_path):
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    brief = tmp_path / "brief.md"
+    brief.write_text("short")  # below 40 char threshold
+    code = orch.main([
+        "--brief", str(brief), "--workdir", str(workdir),
+        "--dev-cmd", "python3 -c pass",
+        "--review-cmd", "python3 -c pass",
+    ])
+    assert code == orch.EXIT_CONTEXT_BLOCKED
+    feature_dir = workdir / ".adversarial-spec" / "brief"
+    final = json.loads((feature_dir / "final.json").read_text())
+    assert final["verdict"] == "CONTEXT_BLOCKED"
+    assert final["context"]["ok"] is False
+    # No provider was ever called: no call records, zero costs.
+    assert final["calls"] == []
+    assert final["costs"]["total"]["prompt_tokens"] == 0
+
+
+def test_context_gate_passes_valid_brief(tmp_path):
+    workdir, code = _scripted_pipeline(tmp_path, APPROVE_REVIEWER)
+    assert code == orch.EXIT_APPROVED
+    final = json.loads(
+        (workdir / ".adversarial-spec" / "demo-feature" / "final.json").read_text())
+    assert final["verdict"] == "APPROVED"
+    assert final["context"]["ok"] is True
+
+
+# --- R4: costs and complexity land in final.json ----------------------------
+
+def test_final_json_contains_cost_and_complexity(tmp_path):
+    workdir, code = _scripted_pipeline(tmp_path, APPROVE_REVIEWER)
+    assert code == orch.EXIT_APPROVED
+    final = json.loads(
+        (workdir / ".adversarial-spec" / "demo-feature" / "final.json").read_text())
+    assert "costs" in final
+    assert "total" in final["costs"]
+    assert final["costs"]["total"]["prompt_tokens"] > 0
+    assert "est_cost_usd" in final["costs"]["total"]
+    assert len(final["calls"]) > 0
+    assert "complexity" in final
+    assert "level" in final["complexity"]
+    assert "score" in final["complexity"]
+    assert "recommended_agents" in final["complexity"]
+
+
+# --- R5: retry/caps controls via CLI ----------------------------------------
+
+def test_cli_parses_retry_and_caps_args():
+    args = orch.build_parser().parse_args([
+        "--max-retries", "5",
+        "--max-input-chars", "128000",
+        "--max-output-chars", "64000",
+        "--truncate-input",
+    ])
+    assert args.max_retries == 5
+    assert args.max_input_chars == 128000
+    assert args.max_output_chars == 64000
+    assert args.truncate_input is True
+
+
+def test_execution_record_captures_retry_caps(tmp_path):
+    workdir, code = _scripted_pipeline(
+        tmp_path, APPROVE_REVIEWER,
+        extra_args=("--max-retries", "2", "--max-input-chars", "200000",
+                    "--max-output-chars", "16000", "--truncate-input"))
+    assert code == orch.EXIT_APPROVED
+    final = json.loads(
+        (workdir / ".adversarial-spec" / "demo-feature" / "final.json").read_text())
+    assert final["execution"]["max_retries"] == 2
+    assert final["execution"]["max_input_chars"] == 200000
+    assert final["execution"]["max_output_chars"] == 16000
+    assert final["execution"]["truncate_input"] is True
+
+
+# --- R8: epistemic labels land in final.json findings -----------------------
+
+FINDINGS_REVIEWER = textwrap.dedent("""\
+    import json, sys
+    prompt = sys.stdin.read()
+    if "For each finding" in prompt:
+        print(json.dumps({
+            "results": [{"id": "S1", "status": "resolved"}],
+            "verdict": "APPROVE"
+        }))
+    else:
+        print(json.dumps({
+            "findings": [{"id": "S1", "severity": "major",
+                           "section": "Requirements",
+                           "summary": "R1 untestable",
+                           "evidence": "spec §3",
+                           "confidence": "high", "basis": "spec"}],
+            "verdict": "APPROVE", "summary": "acceptable"
+        }))
+""")
+
+
+def test_final_json_contains_epistemic_distribution(tmp_path):
+    workdir, code = _scripted_pipeline(tmp_path, FINDINGS_REVIEWER)
+    assert code == orch.EXIT_APPROVED
+    final = json.loads(
+        (workdir / ".adversarial-spec" / "demo-feature" / "final.json").read_text())
+    assert "epistemic_distribution" in final
+    dist = final["epistemic_distribution"]
+    assert "confidence" in dist
+    assert "basis" in dist
+    assert dist["confidence"]["high"] == 1
+    assert dist["basis"]["spec"] == 1
+    assert dist["combined"]["high/spec"] == 1
