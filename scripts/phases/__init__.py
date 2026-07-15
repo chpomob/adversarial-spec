@@ -11,11 +11,13 @@ adversarial-code-loop's ``scripts/phases``):
 Helpers shared by more than one phase live here:
 
   run_role()           — persona-aware CLI execution with base-name fallback
+  runtime_metadata()   — copy JSON-safe runner evidence from a RunResult
   try_parse_json()     — 3-strategy JSON extraction (fences, ``{..}``, ``[..]``)
   validate_spec_file() — ``spec.md`` existence + YAML frontmatter validation
 """
 
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 # The adversarial-common sibling skill must be importable. The orchestrator
@@ -34,6 +36,8 @@ from .phase_spec import validate_spec_file, validate_spec_text
 __all__ = [
     "run_role",
     "resolve_persona",
+    "runtime_metadata",
+    "merge_runtime",
     "try_parse_json",
     "extract_frontmatter",
     "validate_spec_file",
@@ -59,17 +63,68 @@ def resolve_persona(role, cmd):
     return None
 
 
-def run_role(cmd, prompt, role, timeout, cwd):
+def runtime_metadata(result):
+    """Copy JSON-safe runner evidence without changing tuple compatibility.
+
+    ``runner.run_cli`` returns a tuple-compatible ``RunResult`` whose
+    ``metadata`` carries retry attempts, cap events, and native usage. Plain
+    tuples (test stubs) safely yield an empty mapping.
+    """
+    metadata = getattr(result, "metadata", None)
+    return dict(metadata) if isinstance(metadata, Mapping) else {}
+
+
+def merge_runtime(*runtimes):
+    """Combine attempt/cap evidence across multiple billed provider calls.
+
+    The bad-JSON retry path in challenge/verify issues two real (billed)
+    ``run_cli`` calls but previously surfaced only the second attempt's
+    metadata, silently dropping the first attempt's retry/cap events. Lists
+    accumulate in call order; scalar usage fields keep the last value (the
+    terminal attempt's reconciled usage).
+    """
+    merged = {}
+    attempts = []
+    cap_events = []
+    for runtime in runtimes:
+        if not isinstance(runtime, Mapping):
+            continue
+        attempts.extend(runtime.get("attempts", []))
+        cap_events.extend(runtime.get("cap_events", []))
+        merged.update(runtime)
+    merged["attempts"] = attempts
+    merged["cap_events"] = cap_events
+    return merged
+
+
+def run_role(cmd, prompt, role, timeout, cwd, phase=None, execution=None, ledger=None):
     """Run a role command with its persona injected.
 
     Returns ``(stdout, stderr, returncode)`` from the hardened
-    ``runner.run_cli`` (temp-file IO, process-group kill on timeout).
+    ``runner.run_cli`` (temp-file IO, process-group kill on timeout). When
+    *execution* (retry/caps controls) and *ledger* (a shared ``CostLedger``)
+    are supplied they are threaded into the runner so one run-wide ledger
+    accounts for every phase and every provider call respects the same caps.
+
+    *role* drives the persona (e.g. ``spec-writer``). *phase*, defaulting to
+    *role*, drives the CostLedger's per-stage breakdown; pass the pipeline
+    stage (``write``/``revise_2``/...) so per-stage cost is not collapsed onto
+    the persona dimension.
     """
     cmd = enhance_cmd_for_project(cmd, cwd)
-    return runner.run_cli(
-        cmd, stdin_text=prompt, timeout=timeout, cwd=cwd,
-        persona_file=resolve_persona(role, cmd),
-    )
+    kwargs = {
+        "stdin_text": prompt,
+        "timeout": timeout,
+        "cwd": cwd,
+        "persona_file": resolve_persona(role, cmd),
+        "persona": role or "",
+        "phase": phase or role or "",
+    }
+    if execution:
+        kwargs.update(execution)
+    if ledger is not None:
+        kwargs["ledger"] = ledger
+    return runner.run_cli(cmd, **kwargs)
 
 
 # --- JSON extraction and frontmatter (shared jsonio re-exports) ----------------

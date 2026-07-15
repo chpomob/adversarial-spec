@@ -9,7 +9,7 @@ import json
 
 from adversarial_common import gitops
 
-from . import run_role, validate_spec_file
+from . import run_role, runtime_metadata, validate_spec_file
 
 __all__ = ["run_revise"]
 
@@ -32,13 +32,17 @@ def run_revise(findings, dev_cmd, workdir, timeout, feature, round_n, run=None):
             "Do not print the spec body to stdout.\n\n"
             f"Findings:\n{json.dumps(findings, indent=2)}"
         )
-        stdout, stderr, code = run(dev_cmd, prompt, "spec-writer", timeout, workdir)
+        result = run(dev_cmd, prompt, "spec-writer", timeout, workdir,
+                     phase=f"revise_{round_n}")
+        stdout, stderr, code = result[0], result[1], result[2]
+        runtime = runtime_metadata(result)
         if code != 0:
             return {
                 "phase": "revise",
                 "exit_code": 1,
                 "error": f"REVISE exited {code}: {(stderr or '')[:200]}",
                 "stdout": stdout,
+                "execution": runtime,
             }
         ok, err = validate_spec_file(workdir)
         if not ok:
@@ -47,6 +51,7 @@ def run_revise(findings, dev_cmd, workdir, timeout, feature, round_n, run=None):
                 "exit_code": 1,
                 "error": f"spec validation failed after revise: {err}",
                 "stdout": stdout,
+                "execution": runtime,
             }
         gitops.commit_all(workdir, f"revise: {feature} — round {round_n}")
         return {
@@ -54,6 +59,7 @@ def run_revise(findings, dev_cmd, workdir, timeout, feature, round_n, run=None):
             "exit_code": 0,
             "commit_sha": gitops.head_sha(workdir),
             "stdout": stdout,
+            "execution": runtime,
         }
     except Exception as exc:  # defensive: never leak an exception to the loop
         return {"phase": "revise", "exit_code": 1, "error": str(exc)}

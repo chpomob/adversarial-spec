@@ -35,6 +35,28 @@ def test_unresolved_ignores_results_without_id():
     assert orch._unresolved(findings, results) == findings
 
 
+def test_finalize_finding_ids_rekeys_index_warnings():
+    # A2: a finding without an id is assigned "finding-1"; its epistemic
+    # warning was keyed by the 0-based list index "0" by the shared parser.
+    findings = [{"severity": "major", "section": "X", "summary": "s",
+                 "evidence": "e"}]
+    warnings = [{"code": "epistemic_label_defaulted", "finding_id": "0",
+                 "message": "missing or invalid confidence/basis"}]
+    out = orch._finalize_finding_ids(findings, warnings)
+    assert out[0]["id"] == "finding-1"
+    assert warnings[0]["finding_id"] == "finding-1"  # re-keyed to final id
+
+
+def test_finalize_finding_ids_preserves_existing_id_warnings():
+    # A finding that already carried an id keeps its warning reference stable.
+    findings = [{"id": "S1", "severity": "major", "section": "X",
+                 "summary": "s", "evidence": "e"}]
+    warnings = [{"code": "epistemic_label_defaulted", "finding_id": "S1"}]
+    orch._finalize_finding_ids(findings, warnings)
+    assert findings[0]["id"] == "S1"
+    assert warnings[0]["finding_id"] == "S1"
+
+
 def test_positive_int_rejects_zero_and_garbage():
     with pytest.raises(Exception):
         orch._positive_int("0")
@@ -211,7 +233,7 @@ def test_pipeline_restores_dirty_workdir(tmp_path):
     reviewer = tmp_path / "reviewer.py"
     reviewer.write_text(APPROVE_REVIEWER)
     brief = tmp_path / "demo-feature.md"
-    brief.write_text("# Demo\n")
+    brief.write_text("# Demo feature\n\nUsers need a demo command for testing.\n")
     code = orch.main([
         "--brief", str(brief), "--workdir", str(workdir),
         "--dev-cmd", f"python3 {writer}",

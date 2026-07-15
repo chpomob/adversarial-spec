@@ -8,7 +8,7 @@ YAML frontmatter) and stages/commits everything as
 """
 from adversarial_common import gitops
 
-from . import run_role, validate_spec_file
+from . import run_role, runtime_metadata, validate_spec_file
 
 __all__ = ["run_write"]
 
@@ -40,13 +40,16 @@ def run_write(brief_text, dev_cmd, workdir, timeout, feature, run=None):
             "Do not print the spec body to stdout — write it to disk.\n\n"
             f"Brief:\n\n{brief_text}"
         )
-        stdout, stderr, code = run(dev_cmd, prompt, "spec-writer", timeout, workdir)
+        result = run(dev_cmd, prompt, "spec-writer", timeout, workdir, phase="write")
+        stdout, stderr, code = result[0], result[1], result[2]
+        runtime = runtime_metadata(result)
         if code != 0:
             return {
                 "phase": "write",
                 "exit_code": 1,
                 "error": f"WRITE exited {code}: {(stderr or '')[:200]}",
                 "stdout": stdout,
+                "execution": runtime,
             }
         ok, err = validate_spec_file(workdir)
         if not ok:
@@ -55,6 +58,7 @@ def run_write(brief_text, dev_cmd, workdir, timeout, feature, run=None):
                 "exit_code": 2,
                 "error": f"spec validation failed: {err}",
                 "stdout": stdout,
+                "execution": runtime,
             }
         gitops.commit_all(workdir, f"write: {feature} — {_short_summary(brief_text)}")
         return {
@@ -62,6 +66,7 @@ def run_write(brief_text, dev_cmd, workdir, timeout, feature, run=None):
             "exit_code": 0,
             "commit_sha": gitops.head_sha(workdir),
             "stdout": stdout,
+            "execution": runtime,
         }
     except Exception as exc:  # defensive: never leak an exception to the loop
         return {"phase": "write", "exit_code": 1, "error": str(exc)}

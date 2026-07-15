@@ -10,11 +10,11 @@ from scripts.phases import phase_challenge, phase_revise, phase_verify, phase_wr
 
 
 def fake_run(stdout="", stderr="", code=0, side_effect=None, calls=None):
-    """Build an injectable `run(cmd, prompt, role, timeout, cwd)` stub."""
-    def _run(cmd, prompt, role, timeout, cwd):
+    """Build an injectable `run(cmd, prompt, role, timeout, cwd, phase=...)` stub."""
+    def _run(cmd, prompt, role, timeout, cwd, phase=None, **kwargs):
         if calls is not None:
             calls.append({"cmd": cmd, "prompt": prompt, "role": role,
-                          "timeout": timeout, "cwd": cwd})
+                          "timeout": timeout, "cwd": cwd, "phase": phase})
         if side_effect:
             side_effect(cwd)
         return stdout, stderr, code
@@ -296,3 +296,89 @@ def test_empty_spec_validator_exits_usage(tmp_path):
     path = tmp_path / "spec.md"
     path.write_text("")
     assert phase_spec.main([str(path)]) == 2
+
+
+# --- regression: A1/A3/A4 ----------------------------------------------------------
+
+def _result_with_metadata(stdout="x", stderr="", code=0, metadata=None):
+    """Build a RunResult tuple carrying execution metadata."""
+    from adversarial_common.runner import RunResult
+    return RunResult((stdout, stderr, code), metadata or {})
+
+
+def test_write_validation_failure_carries_execution(git_repo):
+    # A1: the billed spec-writer call ran, then spec validation failed
+    # (exit_code 2). Its execution/runtime evidence must still be attached.
+    run = fake_run(stdout="done")
+    result = phase_write.run_write("brief", "dev", str(git_repo), 60, "f", run=run)
+    assert result["exit_code"] == 2
+    assert "execution" in result  # was silently dropped before A1
+
+
+def test_challenge_retry_accumulates_attempt_metadata(tmp_path):
+    # A3: the bad-JSON retry issues two billed calls; both attempts' runtime
+    # evidence must survive (was overwritten by the retry before A3).
+    (tmp_path / "spec.md").write_text(VALID_SPEC)
+    calls = []
+
+    def _run(cmd, prompt, role, timeout, cwd, phase=None, **kwargs):
+        calls.append(prompt)
+        out = "garbage" if len(calls) == 1 else CHALLENGE_OK
+        return _result_with_metadata(
+            out, "", 0, {"attempts": [{"attempt": len(calls)}], "cap_events": []})
+
+    result = phase_challenge.run_challenge("rev", str(tmp_path), 60, run=_run)
+    assert result["exit_code"] == 0
+    assert len(calls) == 2  # exactly one retry
+    assert [a["attempt"] for a in result["execution"]["attempts"]] == [1, 2]
+
+
+def test_verify_retry_accumulates_attempt_metadata(tmp_path):
+    # A3: same accumulation guarantee for the verify phase.
+    (tmp_path / "spec.md").write_text(VALID_SPEC)
+    calls = []
+
+    def _run(cmd, prompt, role, timeout, cwd, phase=None, **kwargs):
+        calls.append(prompt)
+        out = "garbage" if len(calls) == 1 else VERIFY_OK
+        return _result_with_metadata(
+            out, "", 0, {"attempts": [{"attempt": len(calls)}]})
+
+    result = phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
+                                     run=_run)
+    assert result["exit_code"] == 0
+    assert [a["attempt"] for a in result["execution"]["attempts"]] == [1, 2]
+
+
+def test_write_tags_cost_phase_as_write(git_repo):
+    # A4: the cost-ledger phase bucket tracks the pipeline stage, not persona.
+    calls = []
+    run = fake_run(side_effect=_write_spec, calls=calls)
+    phase_write.run_write("brief", "dev", str(git_repo), 60, "f", run=run)
+    assert calls[0]["phase"] == "write"
+    assert calls[0]["role"] == "spec-writer"
+
+
+def test_revise_tags_cost_phase_with_round(git_repo):
+    (git_repo / "spec.md").write_text(VALID_SPEC)
+    calls = []
+    phase_revise.run_revise([{"id": "S1"}], "dev", str(git_repo), 60, "f", 2,
+                            run=fake_run(side_effect=_write_spec, calls=calls))
+    assert calls[0]["phase"] == "revise_2"
+
+
+def test_verify_tags_cost_phase_with_round(tmp_path):
+    (tmp_path / "spec.md").write_text(VALID_SPEC)
+    calls = []
+    phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
+                            run=fake_run(stdout=VERIFY_OK, calls=calls),
+                            round_n=3)
+    assert calls[0]["phase"] == "verify_3"
+
+
+def test_verify_phase_defaults_without_round(tmp_path):
+    (tmp_path / "spec.md").write_text(VALID_SPEC)
+    calls = []
+    phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
+                            run=fake_run(stdout=VERIFY_OK, calls=calls))
+    assert calls[0]["phase"] == "verify"

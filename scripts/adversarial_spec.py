@@ -8,9 +8,21 @@ On approval the branch is squash-merged into the parent; otherwise a
 ``[REJECTED]`` marker commit is recorded.
 
 Phase logic lives in scripts/phases/*; the shared engine (gitops, providers,
-jsonio) lives in the adversarial-common sibling skill. This file only wires
-phases together and maps verdicts to exit codes (same layout as
-adversarial-code-loop's adversarial_loop.py, minus gates/arbiter/resume).
+jsonio, costs, gates, runner) lives in the adversarial-common sibling skill.
+This file only wires phases together and maps verdicts to exit codes (same
+layout as adversarial-code-loop's adversarial_loop_v4.py, minus gates/arbiter).
+
+Reliability, cost, and adaptive-control integration (R1/R3/R4/R5/R8):
+
+  * R1/R3 — ``gates.check_context(kind="brief")`` runs before any provider or
+    git mutation. A blocked brief writes final.json and exits with
+    EXIT_CONTEXT_BLOCKED before a single ``run_cli`` call.
+  * R4    — a shared ``CostLedger`` threads through every phase; per-model
+    costs and the complexity estimate land in final.json.
+  * R5    — retry/caps controls (``--max-retries``, ``--max-input-chars``,
+    ``--max-output-chars``, ``--truncate-input``) flow through the shared runner.
+  * R8    — challenger findings are epistemically normalized (confidence/basis
+    defaulted to low/inference when absent) with a recorded warning.
 
 Exit codes:
   0 APPROVED — spec squash-merged into the parent branch (or left on its
@@ -18,6 +30,7 @@ Exit codes:
   1 infrastructure failure (phase crash, git error, interrupt)
   2 usage error (bad flags, missing/empty brief)
   3 REJECT   — findings unresolved after max-loops
+  5 CONTEXT_BLOCKED — brief failed the preflight gate before any provider/git
 
 The machine-readable contract is <out>/<feature>/final.json.
 """
@@ -26,6 +39,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -34,14 +48,16 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR.parent))
 sys.path.insert(0, str(_SCRIPTS_DIR.parent.parent / "adversarial-common"))
 
-from adversarial_common import gitops, jsonio
+from adversarial_common import CostLedger, gates, gitops, jsonio, runner
 from adversarial_common.providers import resolve_role_cmd
 from scripts.phases import phase_challenge, phase_revise, phase_verify, phase_write
+from scripts.phases import run_role
 
 EXIT_APPROVED = 0
 EXIT_INFRA = 1
 EXIT_USAGE = 2
 EXIT_REJECTED = 3
+EXIT_CONTEXT_BLOCKED = runner.CI_EXIT_CONTEXT_BLOCKED
 
 DEFAULT_DEV_CMD = "pi --provider zai --model glm-5.2"
 DEFAULT_REVIEW_CMD = "pi --provider deepseek --model deepseek-v4-pro"
@@ -49,6 +65,12 @@ DEFAULT_REVIEW_CMD = "pi --provider deepseek --model deepseek-v4-pro"
 # Verifier statuses that no longer block approval: "resolved" (fixed) and
 # "rejected" (the verifier showed the original finding was wrong).
 _SETTLED_STATUSES = {"resolved", "rejected"}
+
+# Context-gate threshold precedence: CLI flag > adversarial-spec env > shared env.
+_THRESHOLD_ENV = {
+    "min_chars": ("ASPEC_MIN_CONTEXT_CHARS", "ADVERSARIAL_MIN_CHARS"),
+    "min_tokens": ("ASPEC_MIN_CONTEXT_TOKENS", "ADVERSARIAL_MIN_TOKENS"),
+}
 
 
 # --- small helpers -------------------------------------------------------------
@@ -74,6 +96,35 @@ def _ensure_ids(findings):
     return findings
 
 
+def _finalize_finding_ids(findings, warnings=None):
+    """Ensure stable finding ids and re-key epistemic warnings to them.
+
+    ``adversarial_common.jsonio.normalize_findings`` stamps each warning's
+    ``finding_id`` with the raw id or the 0-based list position *before* ids
+    are stable, so a warning can reference ``"0"`` while the finding's final
+    id is ``"finding-1"``. This captures the prior key for every finding,
+    assigns the final ids via :func:`_ensure_ids`, then re-points the warnings
+    so ``final.json`` warnings stay joinable to findings by id.
+    """
+    prior_keys = []
+    for index, finding in enumerate(findings):
+        raw = ""
+        if isinstance(finding, dict):
+            raw = str(finding.get("id") or "").strip()
+        prior_keys.append(raw or str(index))
+    _ensure_ids(findings)
+    if warnings:
+        remap = {
+            old: finding["id"]
+            for finding, old in zip(findings, prior_keys)
+            if isinstance(finding, dict) and old != finding.get("id")
+        }
+        for warning in warnings:
+            if isinstance(warning, dict) and warning.get("finding_id") in remap:
+                warning["finding_id"] = remap[warning["finding_id"]]
+    return findings
+
+
 def _unresolved(findings, results):
     """Findings whose verify status is neither resolved nor rejected."""
     settled = {
@@ -81,6 +132,142 @@ def _unresolved(findings, results):
         if r.get("id") is not None and r.get("status") in _SETTLED_STATUSES
     }
     return [f for f in findings if f.get("id") not in settled]
+
+
+def _threshold_overrides(args):
+    """Resolve brief context thresholds with CLI > spec env > shared env."""
+    overrides = {}
+    for name, env_names in _THRESHOLD_ENV.items():
+        value = getattr(args, name, None)
+        if value is None:
+            for env_name in env_names:
+                raw = os.environ.get(env_name)
+                if raw is None:
+                    continue
+                try:
+                    value = int(raw)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"${env_name} must be a non-negative integer") from exc
+                if value < 0:
+                    raise ValueError(
+                        f"${env_name} must be a non-negative integer")
+                break
+        if value is not None:
+            overrides[name] = value
+    return overrides
+
+
+def _execution_settings(args):
+    """Return runner settings shared by every model phase."""
+    return {
+        "max_retries": getattr(args, "max_retries", 3),
+        "max_input_chars": getattr(
+            args, "max_input_chars", runner.DEFAULT_MAX_INPUT_CHARS),
+        "max_output_chars": getattr(
+            args, "max_output_chars", runner.DEFAULT_MAX_OUTPUT_CHARS),
+        "truncate_input": getattr(args, "truncate_input", False),
+    }
+
+
+def _execution_record(args):
+    """Return serializable effective execution controls for artifacts."""
+    return {
+        **_execution_settings(args),
+        "show_costs": getattr(args, "show_costs", False),
+        "max_agents": getattr(args, "max_agents", 6),
+    }
+
+
+def _preflight(args, brief_text, out_dir):
+    """Run R1/R3 brief context gate before any provider or git call.
+
+    Returns ``(effective_text, context, complexity, cap_events, ok)``. On a blocked brief
+    writes a complete ``final.json`` (with empty costs and the complexity
+    estimate) so CI callers see a machine-readable CONTEXT_BLOCKED verdict and
+    no provider was ever invoiced.
+    """
+    cap_limit = getattr(args, "max_input_chars", runner.DEFAULT_MAX_INPUT_CHARS)
+    capped, truncated = gates.enforce_input_cap(brief_text, cap_limit)
+    cap_events = []
+    if truncated:
+        cap_events.append({
+            "kind": "input",
+            "phase": "preflight",
+            "limit": cap_limit,
+            "original_chars": len(brief_text),
+            "truncated": bool(getattr(args, "truncate_input", False)),
+        })
+    truncate = bool(getattr(args, "truncate_input", False))
+    effective_text = capped if truncate else brief_text
+    context = gates.check_context(
+        "brief", effective_text, _threshold_overrides(args))
+    if truncated and not truncate and context["ok"]:
+        context = dict(context)
+        context.update({
+            "ok": False,
+            "reason": "input_exceeds_max_chars",
+            "max_input_chars": cap_limit,
+            "input_chars": len(brief_text),
+        })
+    complexity = gates.estimate_complexity(
+        effective_text, max_agents=getattr(args, "max_agents", 6))
+    if context["ok"]:
+        return effective_text, context, complexity, cap_events, True
+
+    jsonio.write_final_json(
+        out_dir, "CONTEXT_BLOCKED",
+        status="blocked",
+        context_blocked=True,
+        reason=context["reason"],
+        context=context,
+        thresholds=context.get("thresholds", {}),
+        complexity=complexity,
+        execution=_execution_record(args),
+        attempts=[],
+        cap_events=cap_events,
+        calls=[],
+        costs=CostLedger().summary(),
+        findings=[],
+        epistemic_labels=jsonio.epistemic_distribution([]),
+        warnings=[],
+    )
+    print(f"X context blocked: {context['reason']}", file=sys.stderr)
+    return effective_text, context, complexity, cap_events, False
+
+
+def _record_phase(state, label, result, ledger):
+    """Attach bounded runner evidence and the current ledger to the run state."""
+    runtime = result.get("execution", {}) if isinstance(result, dict) else {}
+    if not isinstance(runtime, dict):
+        runtime = {}
+    call = {
+        "label": label,
+        "ok": bool(isinstance(result, dict) and result.get("exit_code") == 0),
+        "attempts": list(runtime.get("attempts", [])),
+        "cap_events": list(runtime.get("cap_events", [])),
+    }
+    state.setdefault("calls", []).append(call)
+    state.setdefault("attempts", []).extend(
+        {"phase": label, **attempt} for attempt in call["attempts"])
+    state.setdefault("cap_events", []).extend(
+        {"phase": label, **event} for event in call["cap_events"])
+    state["costs"] = ledger.summary()
+    for warning in result.get("warnings", []) if isinstance(result, dict) else []:
+        if warning not in state.setdefault("warnings", []):
+            state["warnings"].append(warning)
+
+
+def _normalize_findings(findings, state=None):
+    """Normalize R8 epistemic labels without dropping or replacing identity."""
+    payload = {"findings": findings}
+    warnings = []
+    jsonio.normalize_findings(payload, warnings=warnings)
+    if state is not None:
+        for warning in warnings:
+            if warning not in state.setdefault("warnings", []):
+                state["warnings"].append(warning)
+    return findings
 
 
 def _log_retrospective(label, result, feature, branch, out_dir):
@@ -191,14 +378,34 @@ def _finish(args, workdir, feature, out_dir, state, verdict, reason="", loops=0)
     except gitops.GitError as exc:
         error = f"git finalize failed: {exc}"
         print(f"X git finalize failed ({verdict}): {exc}")
-    jsonio.write_final_json(
-        out_dir, verdict,
-        reason=reason, loops=loops,
-        branch=state.get("branch", ""),
-        merged=merged,
-        error=error,
-        artifacts_dir=str(out_dir),
-    )
+
+    ledger = getattr(args, "_ledger", None)
+    costs = ledger.summary() if ledger is not None else state.get("costs", {})
+    findings = _normalize_findings(list(state.get("findings", [])), state)
+    distribution = jsonio.epistemic_distribution(findings)
+    final_extra = {
+        "reason": reason,
+        "loops": loops,
+        "branch": state.get("branch", ""),
+        "merged": merged,
+        "artifacts_dir": str(out_dir),
+        "context": state.get("context", getattr(args, "_context", {})),
+        "thresholds": state.get("thresholds", {}),
+        "execution": state.get("execution", _execution_record(args)),
+        "attempts": state.get("attempts", []),
+        "cap_events": state.get("cap_events", []),
+        "calls": state.get("calls", []),
+        "costs": costs,
+        "complexity": state.get("complexity", getattr(args, "_complexity", {})),
+        "findings": findings,
+        "epistemic_labels": distribution,
+        "epistemic_distribution": distribution,
+        "warnings": state.get("warnings", []),
+    }
+    if error:
+        final_extra["error"] = error
+    jsonio.write_final_json(out_dir, verdict, **final_extra)
+
     print(f"\n{verdict}" + (f" — {reason}" if reason else ""))
     if error:
         return EXIT_INFRA
@@ -210,6 +417,13 @@ def _finish(args, workdir, feature, out_dir, state, verdict, reason="", loops=0)
 def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
               brief_text, state):
     """Run the full workflow. Returns the process exit code."""
+    ledger = args._ledger
+    execution = _execution_settings(args)
+    # Bake retry/caps/ledger into a single run callable so every phase shares
+    # one cost ledger and identical execution controls. Phase-level schema
+    # retries (bad JSON) remain owned by each phase module.
+    runner_fn = partial(run_role, execution=execution, ledger=ledger)
+
     # PHASE 0 — GIT SETUP
     setup = _setup_git(workdir, feature, state)
     state.update(setup)
@@ -223,7 +437,8 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
     # PHASE 1 — WRITE
     _banner("WRITE  (SPEC-WRITER)")
     write = phase_write.run_write(brief_text, dev_cmd, workdir,
-                                  args.timeout, feature)
+                                  args.timeout, feature, run=runner_fn)
+    _record_phase(state, "write", write, ledger)
     _write_json(out_dir, "01_write.json", write)
     if write["exit_code"] != 0:
         if write.get("exit_code") == EXIT_USAGE:
@@ -235,12 +450,22 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
     # PHASE 2 — CHALLENGE
     _banner("CHALLENGE  (SPEC-CHALLENGER)")
     challenge = phase_challenge.run_challenge(
-        review_cmd, workdir, args.timeout,
+        review_cmd, workdir, args.timeout, run=runner_fn,
         branch_point=state["branch_point"])
+    # Assign stable finding ids and re-key the challenger's epistemic
+    # warnings to those ids BEFORE recording/persisting: the shared parser
+    # stamps each warning's finding_id from the raw id or the 0-based list
+    # index, which would otherwise point at "0" while the finding's id is
+    # "finding-1".
+    findings = _finalize_finding_ids(
+        challenge.get("findings", []), challenge.get("warnings"))
+    _record_phase(state, "challenge", challenge, ledger)
     _write_json(out_dir, "02_challenge.json", challenge)
     if challenge["exit_code"] != 0:
         return _phase_failed("challenge", challenge, state, out_dir)
-    findings = _ensure_ids(challenge.get("findings", []))
+    # R8: normalize epistemic labels (confidence/basis) on challenger findings.
+    _normalize_findings(findings, state)
+    state["findings"] = findings
     verdict = challenge.get("verdict", "APPROVE")
     print(f"  OK {len(findings)} findings — verdict {verdict}")
 
@@ -255,15 +480,17 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
 
         _banner(f"REVISE  (round {n}/{args.max_loops})")
         revise = phase_revise.run_revise(findings, dev_cmd, workdir,
-                                         args.timeout, feature, n)
+                                         args.timeout, feature, n, run=runner_fn)
+        _record_phase(state, f"revise_{n}", revise, ledger)
         _write_json(out_dir, f"03_revise_{n}.json", revise)
         if revise["exit_code"] != 0:
             return _phase_failed(f"revise_{n}", revise, state, out_dir)
 
         _banner(f"VERIFY  (round {n}/{args.max_loops})")
         verify = phase_verify.run_verify(
-            findings, review_cmd, workdir, args.timeout,
-            branch_point=state["branch_point"])
+            findings, review_cmd, workdir, args.timeout, run=runner_fn,
+            branch_point=state["branch_point"], round_n=n)
+        _record_phase(state, f"verify_{n}", verify, ledger)
         _write_json(out_dir, f"04_verify_{n}.json", verify)
         if verify["exit_code"] != 0:
             return _phase_failed(f"verify_{n}", verify, state, out_dir)
@@ -280,6 +507,7 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
         # keep the current list so the next round sees real content.
         if remaining:
             findings = remaining
+            state["findings"] = findings
 
     if approved:
         return _finish(args, workdir, feature, out_dir, state, "APPROVED",
@@ -299,6 +527,18 @@ def _positive_int(value):
         raise argparse.ArgumentTypeError(f"not an integer: {value!r}")
     if ivalue <= 0:
         raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return ivalue
+
+
+def _non_negative_int(value):
+    """argparse type: integer greater than or equal to zero."""
+    try:
+        ivalue = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not an integer: {value!r}") from exc
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a non-negative integer, got {value!r}")
     return ivalue
 
 
@@ -323,6 +563,42 @@ def build_parser():
     p.add_argument("--out", default=".adversarial-spec", help="Artifacts directory")
     p.add_argument("--no-merge", action="store_true",
                    help="On approval, leave the spec branch unmerged")
+    p.add_argument(
+        "--min-chars", "--min-context-chars", dest="min_chars",
+        type=_non_negative_int, default=None,
+        help="minimum brief characters (env: ASPEC_MIN_CONTEXT_CHARS)",
+    )
+    p.add_argument(
+        "--min-tokens", "--min-context-tokens", dest="min_tokens",
+        type=_non_negative_int, default=None,
+        help="minimum estimated brief tokens (env: ASPEC_MIN_CONTEXT_TOKENS)",
+    )
+    p.add_argument(
+        "--max-retries", type=_non_negative_int, default=3,
+        help="transient retries per provider phase (default: 3)",
+    )
+    p.add_argument(
+        "--max-input-chars", type=_non_negative_int,
+        default=runner.DEFAULT_MAX_INPUT_CHARS,
+        help="hard input cap per provider phase",
+    )
+    p.add_argument(
+        "--max-output-chars", type=_non_negative_int,
+        default=runner.DEFAULT_MAX_OUTPUT_CHARS,
+        help="hard output cap per provider phase",
+    )
+    p.add_argument(
+        "--truncate-input", action="store_true",
+        help="head-truncate oversized provider input instead of rejecting it",
+    )
+    p.add_argument(
+        "--show-costs", action="store_true",
+        help="print the final per-model cost breakdown to stderr",
+    )
+    p.add_argument(
+        "--max-agents", type=_positive_int, default=6,
+        help="complexity recommendation cap recorded for adaptive execution",
+    )
     return p
 
 
@@ -358,16 +634,6 @@ def main(argv=None):
         print("X Empty brief (pass --brief <file> or pipe the brief on stdin)")
         return EXIT_USAGE
 
-    ok, info = gitops.ensure_git_available()
-    if not ok:
-        print(f"X {info}")
-        return EXIT_INFRA
-
-    dev_cmd = resolve_role_cmd("dev", args.dev_cmd, "ASPEC_DEV_CMD",
-                               DEFAULT_DEV_CMD)
-    review_cmd = resolve_role_cmd("review", args.review_cmd, "ASPEC_REVIEW_CMD",
-                                  DEFAULT_REVIEW_CMD)
-
     feature = _derive_feature(args, brief_text)
     if not feature:
         print("X Could not derive a feature name; pass --feature")
@@ -379,23 +645,67 @@ def main(argv=None):
     out_dir = out_base / feature
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # R1/R3 — brief preflight. Runs before git availability, command
+    # resolution, or any provider call. A blocked brief exits with
+    # EXIT_CONTEXT_BLOCKED and writes final.json with zero run_cli calls.
+    try:
+        brief_text, context, complexity, cap_events, preflight_ok = _preflight(
+            args, brief_text, out_dir)
+    except (TypeError, ValueError) as exc:
+        print(f"X invalid preflight configuration: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    args._context = context
+    args._complexity = complexity
+    args._preflight_cap_events = cap_events
+    if not preflight_ok:
+        return EXIT_CONTEXT_BLOCKED
+
+    # R1/R3 succeeded. Only now may git or command resolution run.
+    ok, info = gitops.ensure_git_available()
+    if not ok:
+        print(f"X {info}")
+        return EXIT_INFRA
+
+    dev_cmd = resolve_role_cmd("dev", args.dev_cmd, "ASPEC_DEV_CMD",
+                               DEFAULT_DEV_CMD)
+    review_cmd = resolve_role_cmd("review", args.review_cmd, "ASPEC_REVIEW_CMD",
+                                  DEFAULT_REVIEW_CMD)
+
+    # R4 — one shared ledger accounts for every provider call across phases.
+    args._ledger = CostLedger()
+
     print(f"\n{'#' * 60}\n  ADVERSARIAL SPEC\n"
           f"  Feature: {feature}\n  Max loops: {args.max_loops}\n"
           f"  WRITER: {dev_cmd[:60]}\n  CHALLENGER: {review_cmd[:60]}\n{'#' * 60}")
 
-    state = {}
+    state = {
+        "context": context,
+        "thresholds": context.get("thresholds", {}),
+        "complexity": complexity,
+        "execution": _execution_record(args),
+        "attempts": [],
+        "calls": [],
+        "cap_events": list(cap_events),
+        "warnings": [],
+        "costs": args._ledger.summary(),
+        "findings": [],
+    }
     try:
         code = _pipeline(args, dev_cmd, review_cmd, workdir, feature,
                          out_dir, brief_text, state)
     except KeyboardInterrupt:
         print("\nX Interrupted — restoring workdir (spec branch kept)")
+        state["costs"] = args._ledger.summary()
         code = EXIT_INFRA
     except gitops.GitError as exc:
         print(f"\nX git error: {exc}")
+        state["costs"] = args._ledger.summary()
         code = EXIT_INFRA
     finally:
         _restore(workdir, state)
 
+    if args.show_costs:
+        args._ledger.print_summary(file=sys.stderr)
     return code
 
 
