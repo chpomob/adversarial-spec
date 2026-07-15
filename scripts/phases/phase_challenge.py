@@ -36,13 +36,12 @@ def _validate(payload):
     return True
 
 
-def _build_prompt(spec_text, branch_point=""):
+def _build_prompt(branch_point=""):
     diff_base = branch_point or "<branch-point>"
     return (
-        "Challenge the specification below (also on disk at `spec.md` in the "
-        "current directory).\n"
-        f"The branch-point SHA for this review is `{diff_base}`. Inspect "
-        f"the cumulative change with `git diff {diff_base}..HEAD`.\n"
+        "Challenge the specification at `spec.md` (in the current directory). "
+        f"The branch-point SHA is `{diff_base}`. Inspect the cumulative "
+        f"change with `git diff {diff_base}..HEAD`.\n"
         "Look for, in priority order: missing requirements, contradictions, "
         "untestable acceptance criteria, scope creep, ambiguous wording, "
         "formatting/consistency issues.\n\n"
@@ -51,8 +50,7 @@ def _build_prompt(spec_text, branch_point=""):
         '"section": "Problem|Requirements|Acceptance criteria|targets|frontmatter", '
         '"summary": "one-line issue", "evidence": "exact spec text or id"}], '
         '"verdict": "REQUEST_CHANGES|APPROVE|REJECT", '
-        '"summary": "counts by severity"}\n\n'
-        f"--- spec.md ---\n{spec_text}"
+        '"summary": "counts by severity"}\n'
     )
 
 
@@ -71,7 +69,7 @@ def run_challenge(review_cmd, workdir, timeout, run=None, branch_point=""):
         return {"phase": "challenge", "exit_code": 1,
                 "error": f"could not read spec.md: {exc}"}
 
-    prompt = _build_prompt(spec_text, branch_point)
+    prompt = _build_prompt(branch_point)
     parse_warnings = []
 
     def _attempt(prompt_text):
