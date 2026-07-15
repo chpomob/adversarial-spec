@@ -95,6 +95,36 @@ Loaded from adversarial-common/personas/:
 | 2 | Usage error |
 | 3 | REJECT |
 
+## Language discipline
+
+All pipeline-internal text (spec, commit messages, findings, JSON) is **English**.
+User-facing conversation stays in the conversation's language. Write the brief in
+English unless the user explicitly instructs otherwise. A spec written in French or
+other non-English languages will break later pipeline stages (plan, code loop) that
+expect English section headings and identifiers.
+
+## Model pairing rules
+
+- **Writer and challenger MUST be different models** (never the same model for both roles).
+- **Preferred pairing:** Codex (writer) + Claude Fable 5 via tmux (challenger).
+- **Fallback when Claude quota low / timeout:** GLM-5.2 via `pi -p --provider zai --model glm-5.2 --thinking high` (challenger).
+- **Fallback when Codex quota low / no API:** GLM-5.2 via `pi` (writer).
+- **DeepSeek is NOT a fallback for spec-challenger unless explicitly requested.**
+  The user prefers Claude or GLM for this role.
+
+## Prompt design
+
+- **NEVER embed the brief or spec text in the challenge prompt.** The challenge
+  prompt tells the model to read the brief and spec from the current directory
+  (set via claude-tmux's `--cwd` flag). Embedding contradicts the adversarial
+  design principle that context lives on disk / in git.
+- The challenge prompt should be under ~2K chars: "Challenge the specification at
+  \`spec.md\` against its brief at \`brief.md\` (both in the current directory).
+  Output ONLY valid JSON: {"findings": [...], "verdict": "..."}"
+- If the claude-tmux wrapper is used as challenger, ensure `--cwd` points to the
+  workdir so the model can read the files. Without `--cwd`, the tmux session
+  starts in the wrong directory and the model cannot find plan.md/spec.md.
+
 ## Pitfalls
 
 - Keep the brief concise but complete. Grill-me can expand a vague idea before feeding it here.
@@ -106,6 +136,10 @@ Loaded from adversarial-common/personas/:
 - **Fallback when Claude fails:** DeepSeek (`pi --provider deepseek --model deepseek-v4-pro`) or GLM-5.2 (`pi -p --provider zai --model glm-5.2 --thinking high`). Both output clean JSON reliably.
 - **Validated pairing (2026-07): Codex DEV + Claude REVIEW** across all 3 stages (spec, plan, code loop). All in 1 cycle. See `adversarial-plan` references/codex-claude-full-pipeline.md.
 - **Pre-existing PR review feedback shapes the brief.** When the user already has an open PR with reviewer comments (e.g. hermes-sweeper, teknium1), read the full review before writing the brief. The spec must explicitly address each review finding so the pipeline doesn't re-propose code the reviewer already rejected. Document the review verdict and each finding in the brief's context section. The spec-challenger will independently validate the approach, which serves as a second opinion on whether the review feedback was correctly interpreted.
+- **Requirement ID format is regex-constrained.** The validation regex expects `R1:` or `R1-` (colon or hyphen after the ID). `R1 (P0) —` or `R1 —` with em dash will NOT match — shows "Requirements section has no identifiable requirement ids". Always write requirements as `- R1: description` or `- R1 - description`. The em dash `—` is not in the regex lookahead set.
+- **Acceptance criteria format similarly constrained.** The regex expects `AC1 (R1):` at the start of a bullet line. No space between `)` and `:`. Wrong: `- AC1 (R1) : text`. Right: `- AC1 (R1): text`.
+- **Keep the spec in English.** All pipeline-internal text (spec, plan, commit messages, findings) must be English. Only user-facing conversation stays in the user's language. Write the brief in English unless you explicitly instruct otherwise.
+- **If the spec-writer produces a valid spec in the wrong format**, fix the format with a script (regex replace em dashes and parenthesized markers) rather than re-running the WRITE phase. The validation regexes are strict — small formatting issues cause silent failures.
 
 ## Known Issues (from 2026-07-14 pre-publication review)
 
