@@ -12,7 +12,7 @@ jsonio, costs, gates, runner) lives in the adversarial-common sibling skill.
 This file only wires phases together and maps verdicts to exit codes (same
 layout as adversarial-code-loop's adversarial_loop_v4.py, minus gates/arbiter).
 
-Reliability, cost, and adaptive-control integration (R1/R3/R4/R5/R8):
+Reliability, cost, and adaptive-control integration (R1/R3/R4/R5/R8/R9/R10/R11/R12):
 
   * R1/R3 — ``gates.check_context(kind="brief")`` runs before any provider or
     git mutation. A blocked brief writes final.json and exits with
@@ -23,6 +23,16 @@ Reliability, cost, and adaptive-control integration (R1/R3/R4/R5/R8):
     ``--max-output-chars``, ``--truncate-input``) flow through the shared runner.
   * R8    — challenger findings are epistemically normalized (confidence/basis
     defaulted to low/inference when absent) with a recorded warning.
+  * R9    — ``--html`` renders a self-contained ``report.html`` next to
+    ``final.json``; ``--ci`` maps the verdict to stable, policy-driven exit
+    codes so CI callers can branch on the process result.
+  * R10   — ``--deep-research`` runs bounded, non-fatal external research
+    after preflight and feeds the evidence into the spec-writer's brief.
+  * R11   — ``--fail-on`` selects the CI failure policy (findings, severities,
+    verdicts, confidence/basis); ``none`` disables findings-based failure.
+  * R12   — ``--delegated`` routes high-complexity briefs to bounded workers
+    (decomposition -> workers -> synthesis); below the ``high`` tier it
+    records a fallback and continues with the direct write.
 
 Exit codes:
   0 APPROVED — spec squash-merged into the parent branch (or left on its
@@ -37,7 +47,10 @@ The machine-readable contract is <out>/<feature>/final.json.
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -48,10 +61,15 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR.parent))
 sys.path.insert(0, str(_SCRIPTS_DIR.parent.parent / "adversarial-common"))
 
-from adversarial_common import CostLedger, gates, gitops, jsonio, runner
+from adversarial_common import CostLedger, gates, gitops, jsonio, report, runner
 from adversarial_common.providers import resolve_role_cmd
 from scripts.phases import phase_challenge, phase_revise, phase_verify, phase_write
-from scripts.phases import run_role
+from scripts.phases import (
+    merge_runtime,
+    run_role,
+    runtime_metadata,
+    validate_spec_file,
+)
 
 EXIT_APPROVED = 0
 EXIT_INFRA = 1
@@ -179,6 +197,319 @@ def _execution_record(args):
     }
 
 
+# --- optional modes: report / CI / research / delegation (R9-R12) --------------
+
+def _json_safe(value):
+    """Return a JSON-serializable copy, dropping non-serializable leaves.
+
+    Delegated/research records carry tuple-like ``result`` objects and other
+    non-serializable runner internals; this keeps ``final.json`` writable
+    without losing the surrounding audit evidence. ``RunResult`` is a tuple
+    subclass that also carries a ``.metadata`` mapping (retry attempts, cap
+    events, native usage); a plain tuple iteration walks only the positional
+    values and silently drops that metadata, so a RunResult is expanded into
+    a dict that preserves both the values and the metadata, keeping the
+    retry/cap evidence recoverable from ``01_delegated.json``.
+    """
+    metadata = getattr(value, "metadata", None)
+    if isinstance(value, tuple) and isinstance(metadata, Mapping):
+        return {
+            "values": [_json_safe(item) for item in value],
+            "metadata": _json_safe(dict(metadata)),
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _warn(state, code, message):
+    """Append a structured warning to the run state (deduplicated)."""
+    warning = {"code": code, "message": message}
+    if warning not in state.setdefault("warnings", []):
+        state["warnings"].append(warning)
+
+
+def _write_final_with_options(args, out_dir, verdict, **extra):
+    """Write ``final.json`` with an optional CI block, then render HTML.
+
+    Centralizes the R9 (``--html`` / ``--ci``) post-processing so the
+    preflight-blocked path and the normal finish path share one contract:
+    the CI exit code is recorded inside the artifact, and the HTML report is
+    rendered from the same bytes a caller will read back.
+    """
+    if getattr(args, "html", False):
+        extra.setdefault("html_report", str(Path(out_dir) / "report.html"))
+    if getattr(args, "ci", False):
+        policy = runner.parse_fail_on(getattr(args, "fail_on", None))
+        exit_code = runner.ci_exit_code(
+            verdict,
+            findings=extra.get("findings", []),
+            fail_on_selector=getattr(args, "fail_on", None),
+            context_blocked=bool(extra.get("context_blocked"))
+            or verdict == "CONTEXT_BLOCKED",
+            infrastructure=verdict in {"ERROR", "INFRA"},
+        )
+        extra.setdefault("ci", {
+            "enabled": True,
+            "fail_on": sorted(policy),
+            "exit_code": exit_code,
+        })
+    final_path = jsonio.write_final_json(out_dir, verdict, **extra)
+    if getattr(args, "html", False):
+        report.render_html_report(final_path)
+    return final_path
+
+
+def _ci_exit_code_from_final(out_dir, legacy_code):
+    """Return the CI exit code recorded in ``final.json``, else *legacy_code*.
+
+    When ``final.json`` is absent (e.g. a mid-pipeline infrastructure failure
+    that never reached the finish step) the legacy exit is preserved; it
+    already encodes the same operational contract (1 = infrastructure).
+    """
+    final_path = Path(out_dir) / "final.json"
+    try:
+        payload = json.loads(final_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return legacy_code
+    ci_meta = payload.get("ci")
+    if isinstance(ci_meta, dict):
+        recorded = ci_meta.get("exit_code")
+        if isinstance(recorded, int) and not isinstance(recorded, bool):
+            return recorded
+    return legacy_code
+
+
+def _run_research(args, brief_text, workdir, out_dir):
+    """Run bounded external research after preflight (R10, opt-in).
+
+    Returns ``(record, findings, warnings)``. The JSON-safe record is
+    persisted as ``00_research.json``. Research is non-fatal: every failure
+    mode (no provider, provider crash, bad JSON) returns a skip record so the
+    pipeline continues without it.
+    """
+    provider_cmd = getattr(args, "research_cmd", None) or os.environ.get(
+        "ASPEC_RESEARCH_CMD")
+    query = "\n\n".join([
+        "Gather authoritative external context for the specification brief below.",
+        "Return bounded JSON with findings/results/items and source identifiers.",
+        "=== BRIEF ===",
+        brief_text,
+    ])
+    try:
+        research = runner.run_research(
+            query,
+            provider_cmd=provider_cmd,
+            enabled=True,
+            max_results=getattr(args, "max_research_results",
+                                runner.DEFAULT_RESEARCH_MAX_RESULTS),
+            timeout=getattr(args, "research_timeout",
+                            runner.DEFAULT_RESEARCH_TIMEOUT),
+            max_input_chars=min(
+                getattr(args, "max_input_chars", runner.DEFAULT_MAX_INPUT_CHARS),
+                runner.DEFAULT_RESEARCH_MAX_INPUT_CHARS),
+            max_output_chars=min(
+                getattr(args, "max_output_chars", runner.DEFAULT_MAX_OUTPUT_CHARS),
+                runner.DEFAULT_RESEARCH_MAX_OUTPUT_CHARS),
+            ledger=args._ledger,
+            cwd=workdir,
+            stderr=sys.stderr,
+        )
+    except Exception as exc:  # defensive: research never aborts the pipeline
+        reason = f"research integration error: {type(exc).__name__}: {exc}"
+        print(f"Research skipped: {reason}", file=sys.stderr)
+        research = {
+            "enabled": True, "status": "skipped", "non_fatal": True,
+            "reason": reason, "findings": [], "calls": [], "warnings": [],
+        }
+    if not isinstance(research, dict):
+        research = {
+            "enabled": True, "status": "skipped", "non_fatal": True,
+            "reason": "research provider returned no record", "findings": [],
+            "calls": [], "warnings": [],
+        }
+    record = _json_safe(research)
+    findings = [
+        finding for finding in (record.get("findings") or [])
+        if isinstance(finding, dict)
+    ] if isinstance(record, dict) else []
+    warnings = [
+        warning for warning in (record.get("warnings") or [])
+        if isinstance(warning, dict)
+    ] if isinstance(record, dict) else []
+    _write_json(out_dir, "00_research.json", record)
+    return record, findings, warnings
+
+
+def _enrich_brief_with_research(brief_text, research_findings):
+    """Append external research evidence to the brief for the spec-writer."""
+    return "\n\n".join([
+        brief_text,
+        "=== EXTERNAL RESEARCH EVIDENCE ===",
+        json.dumps(research_findings, ensure_ascii=False, sort_keys=True),
+        "Incorporate this evidence only where independently relevant.",
+    ])
+
+
+def _delegated_execution(delegated):
+    """Merge retry/cap-event metadata from every delegated provider call.
+
+    Each delegated stage (decomposition, workers, synthesis) issues a real
+    billed ``run_cli`` call whose ``RunResult.metadata`` records retries,
+    input/output cap events, and native usage. Routing that evidence through
+    :func:`merge_runtime` mirrors how the direct write/challenge/verify phases
+    surface ``execution`` via :func:`runtime_metadata`, so ``_record_phase``
+    feeds ``state["attempts"]``/``state["cap_events"]``/``state["calls"]``
+    identically for delegated and direct runs, instead of emitting an empty
+    ``execution`` that silently drops the delegated audit trail.
+    """
+    runtimes = []
+    if isinstance(delegated, dict):
+        decomposition = delegated.get("decomposition")
+        if isinstance(decomposition, dict):
+            runtimes.append(runtime_metadata(decomposition.get("result")))
+        for worker in delegated.get("workers") or []:
+            if isinstance(worker, dict):
+                runtimes.append(runtime_metadata(worker.get("result")))
+        synthesis = delegated.get("synthesis")
+        if isinstance(synthesis, dict):
+            runtimes.append(runtime_metadata(synthesis.get("result")))
+    return merge_runtime(*runtimes)
+
+
+def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
+                         complexity, state, out_dir):
+    """Delegate spec writing for high-complexity briefs (R12, opt-in).
+
+    Returns a write-phase result dict when delegation produces a valid
+    ``spec.md``, or ``None`` to signal the caller should run the direct write.
+    Below the ``high`` complexity tier, or when synthesis fails to produce a
+    valid spec, a fallback is recorded on *state* and ``None`` is returned so
+    the pipeline always completes.
+    """
+    if not getattr(args, "delegated", False):
+        return None
+    level = complexity.get("level") if isinstance(complexity, dict) else None
+    if level != "high":
+        reason = (f"delegated write skipped: complexity level {level!r} "
+                  f"is below required level 'high'")
+        state["delegated"] = {
+            "delegated": False, "mode": "direct", "status": "fallback",
+            "reason": reason, "complexity": complexity,
+        }
+        _warn(state, "delegation_fallback", reason)
+        print(f"! {reason}; continuing with direct write", file=sys.stderr)
+        return None
+
+    ledger = args._ledger
+    execution = _execution_settings(args)
+    timeout = args.timeout
+    orchestrator_cmd = args.orchestrator_cmd or dev_cmd
+    worker_cmd = args.worker_cmd or dev_cmd
+    synth_cmd = args.synth_cmd or dev_cmd
+    max_concurrency = min(getattr(args, "max_agents", 6),
+                          getattr(args, "max_concurrency", 6))
+
+    # Filesystem isolation for concurrent delegated calls. Decomposition and
+    # each worker run in their own private working directory OUTSIDE the git
+    # tree, so a misbehaving worker (the default dev_cmd is a full agentic CLI
+    # that may run shell commands or edit files despite the prompt) cannot
+    # stomp on a sibling worker or pollute *workdir*; otherwise the synthesis
+    # stage's subsequent ``gitops.commit_all`` would silently fold any stray
+    # concurrent mutations into the delegated-spec commit. Synthesis itself
+    # must keep ``cwd=workdir`` because its job is to write ``spec.md`` there
+    # for that commit, and it runs alone after every worker has finished.
+    isolated_dirs = []
+
+    def _isolated_cwd(prefix):
+        path = tempfile.mkdtemp(prefix=prefix)
+        isolated_dirs.append(path)
+        return path
+
+    def decomposition_call(payload):
+        prompt = "\n\n".join([
+            "Decompose this specification brief into independent concern areas.",
+            ('Return JSON only: {"tasks":[{"id":"stable-id",'
+             '"scope":"concern","instructions":"what to specify"}]}.'),
+            f"Create at most {max_concurrency} tasks.",
+            "=== BRIEF ===",
+            payload if isinstance(payload, str) else brief_text,
+        ])
+        return partial(run_role, orchestrator_cmd, prompt, "spec-writer",
+                       timeout, _isolated_cwd("aspec-decompose-"),
+                       phase="delegated_decomposition",
+                       execution=execution, ledger=ledger)
+
+    def worker_call(task):
+        prompt = "\n\n".join([
+            "Draft the specification section for the delegated scope below.",
+            "Return markdown for your section only (no full-file frontmatter).",
+            "=== DELEGATED TASK ===",
+            json.dumps(_json_safe(task), ensure_ascii=False, sort_keys=True),
+            "=== FULL BRIEF ===",
+            brief_text,
+        ])
+        return partial(run_role, worker_cmd, prompt, "spec-writer", timeout,
+                       _isolated_cwd("aspec-worker-"), phase="delegated_worker",
+                       execution=execution, ledger=ledger)
+
+    def synthesis_call(survivors):
+        sections = "\n\n".join(
+            survivor.get("stdout", "") for survivor in survivors
+            if isinstance(survivor, dict))
+        prompt = "\n\n".join([
+            "Merge the delegated spec sections below into one complete spec.",
+            "Write the file `spec.md` to disk in the current working directory,",
+            "with YAML frontmatter (name, version, author, status, tags, targets)",
+            "then Problem, Requirements, Acceptance criteria. Do not print body.",
+            "=== DELEGATED SECTIONS ===",
+            sections,
+        ])
+        return partial(run_role, synth_cmd, prompt, "spec-writer", timeout,
+                       workdir, phase="delegated_synthesis", execution=execution,
+                       ledger=ledger)
+
+    _banner("WRITE  (DELEGATED)")
+    try:
+        delegated = runner.run_delegated(
+            brief_text, decomposition_call, worker_call, synthesis_call,
+            max_concurrency=max_concurrency, complexity=complexity)
+    finally:
+        # Best-effort: tear down every per-stage working directory once the
+        # concurrent calls (all completed or failed by now) no longer need it.
+        for path in isolated_dirs:
+            shutil.rmtree(path, ignore_errors=True)
+    state["delegated"] = _json_safe(delegated)
+    _write_json(out_dir, "01_delegated.json", state["delegated"])
+
+    synthesis = delegated.get("synthesis") if isinstance(delegated, dict) else None
+    if isinstance(delegated, dict) and delegated.get("status") == "synthesized" \
+            and isinstance(synthesis, dict):
+        ok, err = validate_spec_file(workdir)
+        if ok:
+            gitops.commit_all(workdir, f"write: {feature} — delegated spec")
+            print(f"  OK delegated ({delegated.get('tasks_dispatched', 0)} tasks) "
+                  f"commit {gitops.head_sha(workdir)[:12]}")
+            return {
+                "phase": "write", "exit_code": 0, "delegated": True,
+                "commit_sha": gitops.head_sha(workdir),
+                "stdout": synthesis.get("stdout", ""),
+                "execution": _delegated_execution(delegated),
+            }
+        reason = f"delegated spec validation failed: {err}"
+    else:
+        status = delegated.get("status") if isinstance(delegated, dict) else None
+        reason = (f"delegated synthesis did not complete "
+                  f"(status={status!r}); falling back to direct write")
+    _warn(state, "delegation_fallback", reason)
+    print(f"! {reason}", file=sys.stderr)
+    return None
+
+
 def _preflight(args, brief_text, out_dir):
     """Run R1/R3 brief context gate before any provider or git call.
 
@@ -215,8 +546,10 @@ def _preflight(args, brief_text, out_dir):
     if context["ok"]:
         return effective_text, context, complexity, cap_events, True
 
-    jsonio.write_final_json(
-        out_dir, "CONTEXT_BLOCKED",
+    _write_final_with_options(
+        args,
+        out_dir,
+        "CONTEXT_BLOCKED",
         status="blocked",
         context_blocked=True,
         reason=context["reason"],
@@ -402,9 +735,14 @@ def _finish(args, workdir, feature, out_dir, state, verdict, reason="", loops=0)
         "epistemic_distribution": distribution,
         "warnings": state.get("warnings", []),
     }
+    if state.get("research") is not None:
+        final_extra["research"] = state["research"]
+        final_extra["research_findings"] = state.get("research_findings", [])
+    if state.get("delegated") is not None:
+        final_extra["delegated"] = state["delegated"]
     if error:
         final_extra["error"] = error
-    jsonio.write_final_json(out_dir, verdict, **final_extra)
+    _write_final_with_options(args, out_dir, verdict, **final_extra)
 
     print(f"\n{verdict}" + (f" — {reason}" if reason else ""))
     if error:
@@ -434,10 +772,13 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
     _banner(f"SPEC BRANCH  {setup['branch']}  (from {setup['parent_branch']})")
     jsonio.save_artifact(out_dir, "00_brief.txt", brief_text)
 
-    # PHASE 1 — WRITE
-    _banner("WRITE  (SPEC-WRITER)")
-    write = phase_write.run_write(brief_text, dev_cmd, workdir,
-                                  args.timeout, feature, run=runner_fn)
+    # PHASE 1 — WRITE (optionally delegated for high-complexity briefs, R12)
+    write = _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
+                                 state.get("complexity", {}), state, out_dir)
+    if write is None:
+        _banner("WRITE  (SPEC-WRITER)")
+        write = phase_write.run_write(brief_text, dev_cmd, workdir,
+                                      args.timeout, feature, run=runner_fn)
     _record_phase(state, "write", write, ledger)
     _write_json(out_dir, "01_write.json", write)
     if write["exit_code"] != 0:
@@ -542,6 +883,15 @@ def _non_negative_int(value):
     return ivalue
 
 
+def _fail_on_arg(value):
+    """argparse type: validate a --fail-on selector via the shared parser."""
+    try:
+        runner.parse_fail_on(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Adversarial Spec "
@@ -598,6 +948,40 @@ def build_parser():
     p.add_argument(
         "--max-agents", type=_positive_int, default=6,
         help="complexity recommendation cap recorded for adaptive execution",
+    )
+    p.add_argument("--html", action="store_true",
+                   help="render a self-contained report.html after final.json")
+    p.add_argument("--ci", action="store_true",
+                   help="enable deterministic CI exit-code policy")
+    p.add_argument("--fail-on", type=_fail_on_arg, default=None,
+                   help="comma-separated CI selectors (default: findings)")
+    p.add_argument("--deep-research", action="store_true",
+                   help="run bounded external research after preflight")
+    p.add_argument("--research-cmd", default=None,
+                   help="research provider command (env: ASPEC_RESEARCH_CMD "
+                        "or ADVERSARIAL_RESEARCH_CMD)")
+    p.add_argument(
+        "--max-research-results", "--research-max-results",
+        dest="max_research_results", type=_non_negative_int,
+        default=runner.DEFAULT_RESEARCH_MAX_RESULTS,
+        help="maximum external evidence items (default: 5)",
+    )
+    p.add_argument(
+        "--research-timeout", type=_positive_int,
+        default=runner.DEFAULT_RESEARCH_TIMEOUT,
+        help="research provider timeout in seconds (default: 60)",
+    )
+    p.add_argument("--delegated", action="store_true",
+                   help="delegate high-complexity spec writing to bounded workers")
+    p.add_argument("--orchestrator-cmd", default=None,
+                   help="delegation decomposition command (default: --dev-cmd)")
+    p.add_argument("--worker-cmd", default=None,
+                   help="delegated worker command (default: --dev-cmd)")
+    p.add_argument("--synth-cmd", default=None,
+                   help="delegation synthesis command (default: --dev-cmd)")
+    p.add_argument(
+        "--max-concurrency", type=_positive_int, default=6,
+        help="delegated worker concurrency cap (default: 6)",
     )
     return p
 
@@ -658,6 +1042,8 @@ def main(argv=None):
     args._complexity = complexity
     args._preflight_cap_events = cap_events
     if not preflight_ok:
+        if getattr(args, "ci", False):
+            return _ci_exit_code_from_final(out_dir, EXIT_CONTEXT_BLOCKED)
         return EXIT_CONTEXT_BLOCKED
 
     # R1/R3 succeeded. Only now may git or command resolution run.
@@ -690,6 +1076,19 @@ def main(argv=None):
         "costs": args._ledger.summary(),
         "findings": [],
     }
+    # R10 — opt-in bounded external research, run after preflight succeeds.
+    # Findings enrich the spec-writer's input; the record is persisted in
+    # final.json. Research is non-fatal and never blocks the pipeline.
+    if getattr(args, "deep_research", False):
+        _research, _research_findings, _research_warnings = _run_research(
+            args, brief_text, workdir, out_dir)
+        state["research"] = _research
+        state["research_findings"] = _research_findings
+        for _warning in _research_warnings:
+            if _warning not in state["warnings"]:
+                state["warnings"].append(_warning)
+        if _research_findings:
+            brief_text = _enrich_brief_with_research(brief_text, _research_findings)
     try:
         code = _pipeline(args, dev_cmd, review_cmd, workdir, feature,
                          out_dir, brief_text, state)
@@ -706,6 +1105,8 @@ def main(argv=None):
 
     if args.show_costs:
         args._ledger.print_summary(file=sys.stderr)
+    if getattr(args, "ci", False):
+        code = _ci_exit_code_from_final(out_dir, code)
     return code
 
 
