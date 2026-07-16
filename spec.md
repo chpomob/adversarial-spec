@@ -176,7 +176,7 @@ dev:
 
 review:
   - alias: claude
-    cmd: "python3 /path/to/claude-tmux.py --model sonnet --timeout 600 --hard-timeout 1800 --cwd {workdir}"
+    cmd: "python3 /path/to/claude-tmux.py --timeout 600 --hard-timeout 1800 --cwd {workdir}"
     quota_check: --claude
     stop_threshold: 90       # skip if used_pct > 90%
 
@@ -190,7 +190,7 @@ review:
 
 challenger:
   - alias: claude
-    cmd: "python3 /path/to/claude-tmux.py --model sonnet --timeout 900 --hard-timeout 1800 --cwd {workdir}"
+    cmd: "python3 /path/to/claude-tmux.py --timeout 900 --hard-timeout 1800 --cwd {workdir}"
     quota_check: --claude
 
   - alias: glm

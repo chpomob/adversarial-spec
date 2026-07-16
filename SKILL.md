@@ -151,6 +151,10 @@ compatible).
 - If the claude-tmux wrapper is used as challenger, ensure `--cwd` points to the
   workdir so the model can read the files. Without `--cwd`, the tmux session
   starts in the wrong directory and the model cannot find plan.md/spec.md.
+- **claude-tmux wrapper v1 does NOT support `--yolo`.** The `--dangerously-skip-permissions`
+  behaviour is the DEFAULT (set `danger=True` in the wrapper, no flag needed). Passing
+  `--yolo` causes argparse exit code 2. Just omit it: `--model sonnet --timeout 900`
+  is sufficient. Validated on the v1 wrapper at `/home/chpo/claude-tmux-wrapper/claude-tmux.py`.
 
 ## Pitfalls
 
