@@ -1,240 +1,144 @@
-# Adversarial Skills Enhancement Spec
+---
+name: "quota-aware-provider-registry"
+version: "1.0"
+author: "adversarial-spec"
+status: "draft"
+tags: [adversarial, spec]
+targets:
+  - file: adversarial-common/adversarial_common/providers.py
+    description: "Define and validate the external provider configuration and resolve its single effective path."
+  - file: adversarial-common/adversarial_common/quota.py
+    description: "Add cached quota collection, provider-state evaluation, role fallback selection, force handling, and selection history."
+  - file: adversarial-common/adversarial_common/runner.py
+    description: "Resolve a quota-eligible command immediately before each configured model phase and expose selection metadata."
+  - file: adversarial-common/adversarial_common/report.py
+    description: "Add sanitized provider-selection history to final run data and rendered reports."
+  - file: adversarial-common/adversarial_common/tests/test_providers.py
+    description: "Cover configuration precedence, schema validation, and model-agnostic alias and role loading."
+  - file: adversarial-common/adversarial_common/tests/test_quota.py
+    description: "Cover cache single-flight behavior, quota states, thresholds, fallbacks, force modes, and placeholder expansion."
+  - file: adversarial-common/adversarial_common/tests/test_runner.py
+    description: "Cover per-phase quota selection, explicit-command bypasses, failures, and provider metadata propagation."
+  - file: adversarial-common/adversarial_common/tests/test_report.py
+    description: "Cover provider history in final and human-readable reports without command or credential leakage."
+  - file: adversarial-spec/scripts/adversarial_spec.py
+    description: "Accept provider-registry flags and map specification phases to writer, challenger, and verify roles."
+  - file: adversarial-spec/tests/test_orchestrator.py
+    description: "Verify provider configuration and force flags across specification phases."
+  - file: adversarial-plan/scripts/adversarial_plan.py
+    description: "Accept provider-registry flags and map planning phases to writer, challenger, and verify roles."
+  - file: adversarial-plan/tests/test_orchestrator.py
+    description: "Verify provider configuration and force flags across planning phases."
+  - file: adversarial-code-loop/scripts/adversarial_loop_v4.py
+    description: "Accept provider-registry flags and map build, review, verify, and arbitration phases to their roles."
+  - file: adversarial-code-loop/scripts/test_loop_fixes.py
+    description: "Verify quota fallback, explicit overrides, reporting, and resume behavior in the code loop."
+  - file: adversarial-code-review/scripts/adversarial_review.py
+    description: "Accept provider-registry flags and use review and arbiter role chains for review and synthesis phases."
+  - file: adversarial-code-review/scripts/check-ai-quota.py
+    description: "Add GLM and DeepSeek probes and return all requested quota checks as one parallel JSON batch."
+  - file: adversarial-code-review/tests/test_review_flags.py
+    description: "Verify registry flags, role mapping, explicit overrides, and final provider history for code review."
+  - file: adversarial-code-review/tests/test_quota_checker.py
+    description: "Verify GLM and DeepSeek flags, normalized states, parallel batching, and partial-error JSON output."
+---
 
-**Status:** Draft · **Scope:** adversarial-common + code-loop + code-review + plan + spec
-**Source:** competitive analysis of 6 projects (adversarial-spec, adverse, adversarial-review, agent-review-panel, devils-advocate, claude-wizard)
+# Quota-Aware Provider Registry for Adversarial Pipelines
 
-## Purpose
+## Problem
 
-Close identified capability gaps in the adversarial skill suite by adding gates
-(reliability, safety, cost), adaptive control, richer output, and two optional
-operating modes. All features hook into the existing `runner.run_cli()` /
-`providers.run_cmd()` / `jsonio.write_final_json(**extra)` core without rewriting it.
+The specification, planning, code-loop, and code-review pipelines currently launch each configured model command without checking whether its account can accept more work. Exhausted sliding windows, invalid keys, rate limits, and depleted prepaid balances therefore appear during a run as timeouts or provider errors. Users must inspect quota manually, replace commands, and resume the pipeline.
 
-## Non-goals
+Version 1 introduces one model-agnostic registry in `adversarial-common`. Pipelines identify only the logical role needed by a phase; an external configuration owns provider aliases, commands, quota-result mappings, thresholds, and ordered role fallbacks. Quota information is refreshed at most once per in-process TTL window and shared by all roles and concurrent phases. Cross-process cache coordination, waiting for resets, automatic retry after reset, quota-aware scheduling, cost-based selection, and a quota dashboard remain out of scope.
 
-- New model providers (existing `detect_provider` universal path already covers new CLIs).
-- A web UI / server. HTML report (R9) is a static single file only.
-- Replacing the persona system or the BUILD→REVIEW→FIX→VERIFY→ARBITER pipeline shape.
-
-## Feature → file map
-
-| Req | Skill(s) touched | New file(s) | Modified file(s) |
-|-----|------------------|-------------|------------------|
-| R1  | common           | `gates.py`  | `runner.py`, scripts |
-| R2  | common           | —           | `providers.py`, `runner.py` |
-| R3  | common           | `gates.py`  | `jsonio.py`, scripts |
-| R4  | common           | `costs.py`  | `runner.py`, `providers.py`, scripts |
-| R5  | common + all pipelines | `gates.py` | `runner.py`, scripts |
-| R6  | common + code-loop | `gates.py` | `scripts/adversarial_loop.py` |
-| R7  | common           | —           | `runner.py` |
-| R8  | common + code-review | —       | `personas/*.md`, `jsonio.py` |
-| R9  | common           | `report.py` | scripts |
-| R10 | common + all pipelines | —      | `runner.py`, scripts |
-| R11 | common + spec/plan | —         | `scripts/adversarial_spec.py`, `scripts/adversarial_plan.py` |
-| R12 | common           | —           | `runner.py` |
+The following compatibility assumptions apply. A user-supplied legacy command flag remains authoritative for the phase or phases it already controls and does not invoke the registry. If no configuration exists at the unoverridden default path, the existing command/environment/default resolution remains available. Once a configuration file is selected, it is the only registry source; an invalid or unreadable explicitly selected file is an error rather than a reason to try another source.
 
 ## Requirements
 
-- R1: Context gate (P0). A pre-flight gate in `adversarial_common/gates.py`
-  (`check_context(input, kind, thresholds)`) that inspects the run's primary
-  input (brief text, spec text, or diff) before any provider call is made. It
-  rejects runs whose context is too thin to produce meaningful adversarial
-  output: empty/whitespace input, below a minimum character or token floor,
-  missing required sections (e.g. a spec with no "Requirements" heading), or a
-  diff that touches zero source lines. Every pipeline script calls
-  `check_context()` as its first action; on refusal it writes a blocked
-  `final.json` (via `jsonio.write_final_json`) and exits with a distinct
-  non-zero code, so CI can tell "blocked on context" apart from "failed".
-  Thresholds are configurable per pipeline (env var + CLI flag), with sane
-  built-in defaults.
+- R1: Every pipeline must resolve at most one provider configuration path in this precedence order: a non-empty `--provider-config` value, then a non-empty `ADVERSARIAL_PROVIDER_CONFIG` value, then `~/.config/adversarial/providers.yaml`. The selected path must support `~` expansion. The loader must not merge files or fall through to a lower-precedence path when the selected file is unreadable or invalid. An absent default file disables registry selection and preserves the legacy resolution path with a warning; a missing path selected explicitly by flag or environment is a startup error.
 
-- R2: Retry with backoff (P0). Transient provider failures are retried inside
-  the execution layer (`providers.run_cmd` / `runner.run_cli`) so every
-  pipeline inherits it for free. Retry is triggered by returncode 124 (timeout
-  only when the elapsed wall-time is far below the configured timeout, i.e. a
-  fast hang), network-style stderr (connection reset, TLS, EOF), and any
-  provider-specific transient signal. Backoff is exponential with jitter:
-  `delay = base * 2**attempt + random(0, jitter)`. Retries stop on
-  non-retryable failures (hard 4xx, malformed-output-after-parse, missing
-  binary / FileNotFoundError) — those propagate immediately. Parameters
-  `max_retries` (default 3), `base` (default 2s), `jitter` (default 1s) are
-  configurable. Each attempt is logged; the final failure still routes through
-  `runner.fail_phase()`.
+- R2: The configuration must be a versioned YAML mapping with the following public field contract: `version: 1`; a `checker` mapping containing non-empty `command`, optional positive `ttl_seconds` (default 30), and optional positive `timeout_seconds` (default 10); a `providers` mapping from arbitrary alias to non-empty `command` and a `quota` mapping; and a `roles` mapping containing ordered alias lists for any of the fixed roles `dev`, `review`, `verify`, `arbiter`, `writer`, and `challenger`. Each `quota` mapping must contain `result_key` and may contain `used_pct_path` plus `stop_above_pct`, `balance_path` plus `stop_below_usd`, or both pairs; paths use dot-separated object keys relative to that provider's checker result. All referenced aliases must exist; role lists must be non-empty and contain no duplicate alias; paired policy fields must appear together; percentage thresholds must be between 0 and 100 inclusive; balance thresholds must be non-negative. Unknown roles, unsupported configuration versions, malformed values, and a required role missing for a phase must produce an actionable configuration error before that phase launches a model.
 
-- R3: Size caps (P0). Hard input and output size limits enforced before and
-  after each provider call to bound cost and prevent context overflow.
-  `gates.py` exposes `enforce_input_cap(text, max_chars, max_tokens_est)` and
-  `enforce_output_cap(text, max_chars)`. The input cap rejects (or, when
-  permitted by a flag, head-truncates with a recorded marker) oversized stdin
-  before it is sent. The output cap guards `runner.run_cli` returns: output
-  exceeding the cap is truncated and flagged rather than silently fed
-  downstream, and `jsonio.parse_json_output` sees the truncation marker so it
-  can fail loudly instead of producing a half-object. Defaults: 256 KiB input,
-  128 KiB output per phase.
+- R3: Provider aliases, model names, commands, result keys, quota thresholds, and fallback ordering used by registry selection must come only from the selected configuration. Shared selection logic and pipeline entry points must work unchanged with invented aliases and commands. Provider-specific knowledge may exist in the external quota-checker adapter, but no pipeline may use it to choose a command.
 
-- R4: Cost tracking (P1). `adversarial_common/costs.py` provides a
-  `CostLedger` that accumulates per-model token usage and estimated cost across
-  a whole run, phase by phase, persona by persona. Token counts come from
-  provider usage metadata when present (claude/codex native), falling back to a
-  deterministic char/4 estimate otherwise. Prices live in a small in-module
-  table keyed by model id, overridable via env/flag. The ledger is threaded
-  through `run_cli`/`run_cmd` calls (return path augmented to include an
-  optional usage record) and its summary is merged into `final.json` through
-  `write_final_json(... costs=ledger.summary())`. A `--show-costs` flag prints
-  the per-model breakdown to stderr.
+- R4: Before the first registry-managed model phase in a TTL window, the quota layer must invoke the configured checker once for all configured provider result keys and parse its JSON response as one batch. The resulting snapshot and warnings must be shared across roles within the process until the positive TTL expires. A checker-wide failure as defined in R9 must be cached for the same `checker.ttl_seconds` duration (default 30 seconds), measured from completion of the failed refresh, and that duration is the cached failure window. Concurrent selection requests at an empty or expired cache must share one in-flight refresh rather than starting duplicate checker processes. Cache age must use a monotonic clock; a changed effective configuration or checker command must not reuse a successful or failed snapshot created for another configuration.
 
-- R5: Complexity gate (P1). `gates.py` provides
-  `estimate_complexity(input, diff_stats) -> {score, level, recommended_agents}`
-  deriving a lightweight complexity score from input length, number of files /
-  lines / hunks in a diff, and breadth of the spec (count of requirements /
-  modules touched). Pipelines use the recommended agent count to scale persona
-  fan-out (e.g. code-review's perspectives, plan's decomposition depth, loop's
-  FIX→VERIFY parallelism). Ranges are tiered: trivial=1, low=2-3, medium=3-4,
-  high=4-6, capped by a configurable `max_agents` (default 6). The score is
-  recorded in `final.json` so the choice is auditable. Never silently removes
-  personas the user explicitly requested via flags — the gate only scales
-  defaults.
+- R5: Each provider candidate must retain the checker's normalized state `OK`, `DRAINING`, `RATE-LIMITED`, `KEY_INVALID`, or `UNKNOWN` and a human-readable reason. `RATE-LIMITED` and `KEY_INVALID` candidates are ineligible. `OK` candidates are eligible. `DRAINING` candidates are eligible with a warning. A missing result, malformed provider result, partial checker error, or unrecognized checker state resolves only that candidate to `UNKNOWN`; `UNKNOWN` remains eligible with a warning so quota infrastructure failure does not break a previously runnable pipeline.
 
-- R6: Verification gates pre/post (P1). The code-loop gains explicit pre- and
-  post-gates around BUILD and each FIX, defined in `gates.py`
-  (`pre_build_gate`, `post_fix_gate`, `post_build_gate`). Pre-build gate checks
-  the build is actually runnable (project markers present, test command
-  resolvable) before spending a model call. Post-build / post-fix gates run the
-  real verification command (tests, lint, typecheck — whatever the project
-  configures) and block progression to REVIEW/ARBITER on failure, routing the
-  failure back into FIX or, after `max_fix_rounds`, to ARBITER with the failing
-  evidence attached. Gate results are recorded as structured entries in
-  `final.json` (command, exit code, truncated log).
+- R6: A configured percentage policy must make a candidate ineligible when the selected numeric `used_pct` value is strictly greater than its stop-above threshold. A configured prepaid policy must make a candidate ineligible when the selected numeric balance is strictly less than its stop-below threshold. Equality at either threshold remains eligible. Valid runtime percentage values are finite numbers from 0 through 100 inclusive, and valid runtime balance values are finite non-negative numbers. A missing, non-numeric, non-finite, or out-of-range runtime metric must resolve the policy to `UNKNOWN` and warn rather than being treated as zero or as unlimited quota. The reason recorded for an ineligible candidate must distinguish checker state, percentage threshold, and balance threshold.
 
-- R7: Parallel model calls (P1). Independent persona/phase calls execute
-  concurrently instead of sequentially. `runner.py` adds a
-  `run_parallel(calls, concurrency=...)` helper that dispatches a list of
-  `(label, run_cli_args)` through a bounded pool (threading — providers are
-  subprocess-bound, not CPU-bound) and returns results in input order. Concurrency
-  defaults to the agent count from R5 (or a flat 3), capped by a configurable
-  max. Applies to code-review perspectives and loop FIX+VERIFY pairs. Failures
-  are reported per-call and do not silently collapse sibling results.
+- R7: For each registry-managed phase, selection must inspect the configured aliases for that phase's role in order, skip every ineligible candidate, and select the first eligible `OK`, `DRAINING`, or `UNKNOWN` candidate. Selection must not reorder candidates by cost, model identity, or remaining quota. Selecting `DRAINING` or `UNKNOWN` must emit a warning before execution. If no candidate is eligible, the phase must fail before any model command starts and report the role plus every attempted alias and its rejection reason.
 
-- R8: Epistemic labels (P1). Every finding emitted by a critic/inspector
-  persona carries an explicit epistemic label so synthesis and the arbiter can
-  weight evidence instead of treating all complaints equally. The label has two
-  parts: `confidence` ∈ {high, medium, low} and `basis` ∈ {spec, code,
-  inference, external}. Personas are updated (`personas/*.md`) to output the
-  label per finding; `jsonio.parse_json_output` and the finding schema enforce
-  its presence (missing/invalid label → finding flagged as
-  `confidence=low,basis=inference` with a warning, never dropped). Synthesis
-  surfaces label distribution and the arbiter down-weights `inference`-only
-  findings.
+- R8: All entry points must accept `--force` and repeatable `--force-provider <role>:<alias>`. Global force selects the first configured alias for each role without invoking the checker or applying checker state or thresholds. A role force selects that exact alias without checking quota and therefore also acts as an explicit choice among fallbacks; the alias must exist in that role's configured chain. A role force takes precedence over global force for its role. Unforced roles in a partially forced run continue to use the shared quota snapshot. For force-option validation, registry configuration is active only when at least one phase reachable under the chosen options remains registry-managed after applying explicit legacy-command overrides and a configuration is selected for that phase; a loaded configuration that every reachable phase bypasses is not active. Invalid syntax, duplicate assignments for one role, unknown roles, unknown aliases, or force options when no registry configuration is active must fail during argument/configuration validation. Forced selections must still expand the work directory, execute normally, and be marked as forced in history.
 
-- R9: HTML report (P2). `adversarial_common/report.py` renders a
-  self-contained, dependency-free HTML artifact from a run's `final.json` (and
-  intermediate artifacts). One file, inline CSS, no external requests, no JS
-  frameworks — stdlib `html` escaping only. Includes: verdict, finding list
-  with epistemic labels (R8), cost breakdown (R4), gate results (R6), and
-  collapsible per-phase raw outputs. Produced when `--html` is passed; path is
-  reported and written next to `final.json`. No new third-party dependency.
+- R9: A legacy model-command flag explicitly present on the command line, including phase-specific code-review command flags, must bypass configuration lookup, quota refresh, threshold evaluation, and force-provider selection for every phase controlled by that flag. Mixed runs are allowed: explicitly overridden phases bypass quota while other phases use their configured role chains. When registry configuration is inactive, existing role-specific environment variables, built-in defaults, optional-command behavior, exit codes, and resume behavior must remain unchanged. If the checker executable is missing, not executable, times out, exits unsuccessfully without usable JSON, or returns unusable top-level JSON, registry-managed phases must run the preferred configured command. The first phase observing such a failure must emit one visible legacy-behavior warning; later phases sharing that cached failure must emit no additional copy, and the failure may be retried only after the cached failure window defined in R4 expires.
 
-- R10: CI-gate mode (P2). A `--ci` flag putting every pipeline into a
-  non-interactive, deterministic mode: no prompts, no color/progress noise on
-  stdout (human detail goes to stderr), exit codes are the contract
-  (0=clean/pass, 2=blocking findings, 3=non-blocking findings, 1=infra
-  failure, context-block code from R1), and the single source of truth is
-  `final.json`. A configurable `--fail-on` selector chooses which verdicts /
-  epistemic levels fail CI. Designed for pre-merge and cron consumption.
+- R10: Immediately before a registry-managed model invocation, every literal `{workdir}` token in the selected command string must be replaced with the absolute work directory for that phase. Commands without the token must be unchanged. Expansion must work for paths containing whitespace and must not reinterpret work-directory characters as additional command arguments. No other placeholder is part of the v1 contract; an unsupported brace-delimited placeholder must be rejected during configuration validation.
 
-- R11: Deep research mode (P2). An optional pre-step, enabled by
-  `--deep-research`, that performs bounded web research to ground the run in
-  current standards/docs (e.g. validating spec assumptions against upstream
-  API/standard docs, or checking review findings against current best practice).
-  Off by default, opt-in only, with a hard result cap and the findings folded
-  in as `basis=external` evidence (R8). The spec and plan pipelines use it
-  before generation; code-review can use it to validate "this is an
-  anti-pattern" claims. Must respect R3 caps and R4 cost budget; failures are
-  non-fatal (research unavailable → run continues without it, logged).
+- R11: The execution layer must perform selection immediately before every model-command invocation managed by the registry, including a second invocation made by a phase to recover from invalid model output and invocations reached after `--resume`. A still-valid snapshot may be reused, but an expired snapshot must be refreshed before selection. Attempts made internally by the existing transient execution retry loop reuse the command already selected for that invocation. Provider fallback precedes the existing command execution, timeout, retry, persona, cost, input-cap, and output-cap behavior; those behaviors must receive the selected command without changing their existing contracts. Concurrent phases must be able to select independently while sharing the quota snapshot.
 
-- R12: Delegated mode (P2). An orchestrator/workers split for large inputs:
-  `--delegated` has an orchestrator model decompose the task and dispatch
-  bounded worker calls (one worker per sub-task / file group), then
-  re-synthesize. Implemented in `runner.py` as a thin layer over `run_parallel`
-  (R7) and gated by complexity (R5) — only offered above a threshold, refused
-  below it to avoid pointless overhead. Orchestrator and worker commands are
-  independently configurable; worker results feed the normal synthesis/arbiter
-  path with an `origin=worker` marker. Failures in a subset of workers degrade
-  gracefully rather than aborting the whole run.
+- R12: Phase-to-role mapping must be stable and provider-neutral. Specification and planning WRITE/PLAN and REVISE phases use `writer`, CHALLENGE uses `challenger`, and VERIFY uses `verify`. Code-loop BUILD and FIX use `dev`, REVIEW uses `review`, VERIFY uses `verify`, and ARBITER uses `arbiter`. Code-review architect, inspector, and cross-review phases use `review`, while final synthesis uses `arbiter`. A pipeline must validate only the roles it can reach under the chosen options; for example, a disabled arbiter must not require an `arbiter` chain. Existing explicit command flags continue to control their historical phases as specified by R9.
+
+- R13: The quota checker must accept composable `--glm` and `--deepseek` flags in addition to its existing provider flags. With no provider flag, it must request every supported provider. Its `--json` output must remain a single object containing `results` keyed by checker result key and an `errors` list, and each successful result must include a normalized state from R5 plus the raw metrics needed for configured percentage or balance policies. Requested checks must run concurrently within one checker invocation. A failure in one check must preserve successful results, identify the failed check in `errors`, and retain the existing non-zero partial-failure exit behavior.
+
+- R14: Every registry selection attempt must append a sanitized history entry containing the pipeline phase, logical role, selected alias or no-selection outcome, normalized state, forced/bypassed status, fallback/rejection reasons, warning text when applicable, and whether the quota snapshot was refreshed or reused. Ordered `provider_history` covering the run must appear in `final.json`, including failure outcomes and selections made after resume, and in the existing human-readable/HTML report when produced. History and warnings must not contain command strings, environment values, credentials, or checker response bodies. Any retained stderr-derived diagnostic must have secrets redacted, be limited to at most 2,000 Unicode code points including a visible `[truncated]` marker when input was omitted, and use no marker when the complete diagnostic fits within the limit.
+
+- R15: Registry configuration and cached quota state must be scoped to one pipeline process. The feature must not wait for quota resets, retry a phase merely because quota may later recover, change phase ordering, select by monetary cost, coordinate cache state with another process, or add a quota-specific dashboard. Existing provider execution retries may continue only under their current transient-error rules after a command has been selected.
 
 ## Acceptance criteria
 
-- AC1 (R1): When the primary input is empty or whitespace-only, the pipeline
-  writes `final.json` with `{"status":"blocked","reason":...}` and exits with
-  the context-block exit code, before any provider subprocess is started
-  (verified: zero `run_cli` invocations).
-- AC2 (R1): A spec missing its required "Requirements" section, or a diff
-  touching zero source lines, is rejected with the same blocked status, and the
-  reason names the specific failed check.
-- AC3 (R1): Thresholds are overridable via both an env var and a CLI flag, and
-  the effective thresholds are echoed in `final.json` for auditability.
-- AC4 (R2): Given a provider that fails returncode 124 with fast elapsed time
-  on the first attempt then succeeds on the second, the run completes
-  successfully and exactly 2 attempts are recorded in the log.
-- AC5 (R2): A non-retryable failure (e.g. FileNotFoundError / hard 4xx) is not
-  retried: `fail_phase` is reached on the first attempt.
-- AC6 (R2): Retries observe `max_retries` and never exceed it; backoff delays
-  are within `[base*2**n, base*2**n + jitter]` for attempt n.
-- AC7 (R3): An input larger than `max_chars` is rejected before the subprocess
-  starts (or, with `--truncate-input`, is head-truncated with a visible marker)
-  and the cap event is recorded.
-- AC8 (R3): A provider return larger than the output cap is truncated and the
-  marker causes `parse_json_output` to return a recorded error rather than a
-  silently truncated object.
-- AC9 (R4): After a multi-phase run, `final.json` contains a `costs` object
-  keyed by model with `{prompt_tokens, completion_tokens, est_cost_usd}` and a
-  total; `--show-costs` prints the same breakdown to stderr.
-- AC10 (R4): When native usage metadata is unavailable, token counts fall back
-  to the char/4 estimate and the record is flagged `estimated=true`.
-- AC11 (R5): Given diffs of trivial / low / medium / high size,
-  `estimate_complexity` returns strictly increasing scores and the documented
-  agent counts, capped at `max_agents`.
-- AC12 (R5): Persona flags explicitly supplied by the user are never removed by
-  the complexity gate; only default fan-out scales.
-- AC13 (R5): The chosen `recommended_agents` is recorded in `final.json`.
-- AC14 (R6): `pre_build_gate` refuses to start BUILD when the configured build
-  command is not resolvable, exiting non-zero before any model call.
-- AC15 (R6): On a failing post-fix gate, the loop routes back to FIX; after
-  `max_fix_rounds` it reaches ARBITER with the failing gate log attached.
-- AC16 (R6): Each gate execution is recorded in `final.json` with its command,
-  exit code, and a truncated log.
-- AC17 (R7): Running N independent persona calls via `run_parallel` completes
-  in wall-time consistent with concurrency-limited parallel execution (not
-  sequential N×latency) and returns results in input order.
-- AC18 (R7): A failure in one of the parallel calls is reported for that call
-  only; sibling calls' results are unaffected.
-- AC19 (R8): A finding without a valid `confidence`/`basis` label is normalized
-  to `confidence=low,basis=inference` with a recorded warning and is not
-  dropped from the output.
-- AC20 (R8): Synthesis output includes the distribution of epistemic labels
-  across findings, and the arbiter's final weighting down-grades
-  `inference`-only findings.
-- AC21 (R9): `--html` writes a single `report.html` file with no external
-  network requests or third-party runtime dependencies, containing verdict,
-  findings (with labels), costs, and gate results.
-- AC22 (R9): All model-supplied strings in the HTML are escaped via the stdlib
-  `html` module (no raw injection of finding text).
-- AC23 (R10): Under `--ci`, stdout carries no prompts or color, exit codes
-  match the documented contract for clean/blocking/non-blocking/infra/context
-  cases, and `final.json` is always written.
-- AC24 (R10): `--fail-on` changes which epistemic levels / verdicts cause a
-  CI-failing exit code.
-- AC25 (R11): `--deep-research` adds research-derived findings tagged
-  `basis=external`; with the flag absent, no research runs and output is
-  byte-for-byte equivalent to a run without the feature.
-- AC26 (R11): When research is unavailable, the run continues without it and
-  logs the skip; no hard failure.
-- AC27 (R12): `--delegated` is accepted only above the complexity threshold
-  (R5); below it, the run proceeds non-delegated with a logged reason.
-- AC28 (R12): A worker failure degrades gracefully — its sub-task is marked
-  failed but the orchestrator still produces a synthesized result from the
-  surviving workers.
-- AC29 (R12): Worker-sourced findings carry an `origin=worker` marker visible
-  in synthesis output.
-- AC30 (R1,R2,R3): The gates/retry/caps layer adds zero new third-party
-  dependencies to adversarial-common (stdlib only).
+- AC1 (R1): Given three distinct paths in the CLI flag, environment variable, and default location, only the CLI path is opened; with no flag only the environment path is opened; with neither override only the expanded default path is opened. An invalid selected override does not cause any lower-precedence path to be opened.
+
+- AC2 (R1): With no file at the default path and no explicit provider-config override, a legacy pipeline command resolves and runs as before, and exactly one registry-disabled warning is visible. A missing flag-selected or environment-selected file exits before a model subprocess starts and names the selected path.
+
+- AC3 (R2): A valid configuration using all six roles, arbitrary aliases, percentage and balance policies, and omitted checker timing values loads with a 30-second TTL and 10-second checker timeout. Parameterized invalid configurations covering an unsupported version, unknown role, missing alias reference, duplicate role alias, empty command, incomplete policy pair, invalid metric path, and out-of-range thresholds are rejected with field-specific errors.
+
+- AC4 (R2): If a reachable phase requests a role absent from an otherwise valid configuration, the phase fails before quota or model subprocesses start and identifies the missing role; a role used only by a disabled optional phase is not required.
+
+- AC5 (R3): A test configuration whose aliases and commands contain no known provider or model names selects and executes its configured fallbacks without a pipeline source change, and the selected alias is the only provider identity exposed to the pipeline.
+
+- AC6 (R4): Ten sequential selections for different roles within a 30-second monotonic-clock window cause exactly one checker invocation; a selection after the clock advances beyond the TTL causes exactly one additional invocation and observes the new results.
+
+- AC7 (R4): Ten concurrent selections against an empty cache block on and share one checker invocation, all observe the same completed snapshot, and a snapshot created for a different effective config/checker identity is not reused.
+
+- AC8 (R5): For candidates reported as `RATE-LIMITED`, `KEY_INVALID`, `DRAINING`, `OK`, and `UNKNOWN`, selection respectively skips the first two, selects the latter three when first eligible, and emits warnings only for `DRAINING` and `UNKNOWN`.
+
+- AC9 (R5): A batch containing one valid result, one malformed result, one missing result, one result with an unsupported state string, and a named partial error preserves the valid state and resolves each of the other affected candidates to `UNKNOWN` with a reason that distinguishes malformed, missing, unrecognized-state, and partial-error cases.
+
+- AC10 (R6): With a stop-above value of 80, runtime usage of 80 remains eligible and 80.01 is skipped; with a stop-below value of 5.00, a balance of 5.00 remains eligible and 4.99 is skipped. Each skipped history entry names the applicable threshold reason.
+
+- AC11 (R6): Missing, non-numeric, non-finite, negative, and over-100 runtime percentage values and missing, non-numeric, non-finite, and negative runtime balance values produce `UNKNOWN` warnings and do not silently become numeric values; zero percentage and zero balance remain valid numeric values subject to their configured thresholds.
+
+- AC12 (R7): Given the ordered chain `[primary, secondary, tertiary]` where primary is rate-limited, secondary exceeds its configured stop threshold, and tertiary is OK, the tertiary command is the only model command started and history records both earlier rejection reasons in order.
+
+- AC13 (R7): When every alias for a role is ineligible, the phase starts no model command, returns an infrastructure/configuration failure through the pipeline's normal failure path, and its diagnostic lists the role and every alias with its reason.
+
+- AC14 (R8): Under `--force`, the first alias is selected without a checker invocation; under `--force-provider review:secondary`, `secondary` is selected without checking quota even when it is not first. Both history entries are marked forced, and an unforced role later in the partially forced run triggers the normal shared quota refresh.
+
+- AC15 (R8): Each invalid force case listed in R8 exits before either checker or model execution. This includes a run where a valid configuration can be selected but explicit legacy flags override every reachable phase; either force option in that run fails as inactive, while the same option is accepted in a mixed run with at least one registry-managed phase. When both global and valid role force are present, the exact role-forced alias is used for that role and the first alias is used for another role.
+
+- AC16 (R9): Supplying an explicit legacy command for one role starts that exact command without invoking the checker or reading that role's chain, while a later non-overridden role in the same run triggers registry selection. With only explicit commands, the checker is never invoked.
+
+- AC17 (R9): For each of a missing checker executable, checker timeout, non-zero response with no parseable results, and malformed top-level JSON, the preferred configured command runs. With `checker.ttl_seconds: 12`, a first phase whose failed refresh completes at monotonic time 0 followed by phases at times 5 and 11 causes one checker invocation and exactly one visible legacy-behavior warning; the first phase at or after time 12 causes one new checker invocation and, if it fails, exactly one new warning for the new failure window.
+
+- AC18 (R10): A command containing `{workdir}` receives the absolute phase work directory as one argument when that path contains spaces and shell metacharacters; a command without the token is byte-for-byte unchanged before normal parsing. A configuration containing `{unknown}` is rejected before execution.
+
+- AC19 (R11): Two phases inside one TTL can select different aliases from different role chains using one snapshot, while a later phase after expiry selects against refreshed states. Existing timeout, transient retry, persona injection, cost accounting, and cap tests pass with a registry-selected command.
+
+- AC20 (R11): Resuming before an unfinished model phase performs selection for that phase and does not rerun completed phases; resuming after the saved snapshot TTL performs a fresh checker invocation before the unfinished phase.
+
+- AC21 (R12): End-to-end tests for each entry point observe the exact role sequence defined in R12 for all enabled phases, with no provider/model inference from a phase name or executable. Disabling arbitration removes the `arbiter` role requirement and invocation.
+
+- AC22 (R8): `--force` and `--force-provider <role>:<alias>` appear with those exact spellings and value shape in `--help` for adversarial-spec, adversarial-plan, adversarial-code-loop, and adversarial-code-review. Each entry point accepts two `--force-provider` occurrences assigning different roles, rejects a duplicate role assignment before subprocess execution, and includes the duplicate role name in its error.
+
+- AC23 (R13): `check-ai-quota.py --json --glm --deepseek` invokes exactly those two checks concurrently and returns both normalized results in one `results` object. With no provider flags, all five supported checks are requested.
+
+- AC24 (R13): When the GLM check fails and the DeepSeek check succeeds, JSON still contains the DeepSeek state and balance metrics, `errors` identifies GLM, and the checker exits non-zero; existing Claude, Codex, and Gemini result fields remain present and compatible when their checks are requested.
+
+- AC25 (R14): A run that rejects one alias, selects a fallback, later reuses the cache, and finally refreshes it writes ordered `provider_history` entries to `final.json` and renders the same phase, role, alias, state, force/bypass, fallback reason, and refresh/reuse facts in the human report.
+
+- AC26 (R14): With commands and checker errors containing sentinel API keys, a checker response-body sentinel, an environment-value sentinel, and a 20,000-character stderr diagnostic, neither `final.json` nor the human/HTML report contains any sentinel, key, or command text; every stderr-derived field is at most 2,000 Unicode code points and ends with `[truncated]`. A separate complete 100-character stderr diagnostic is retained without a truncation marker.
+
+- AC27 (R15): Integration tests with an exhausted provider confirm the pipeline neither sleeps until reset nor reruns the phase for quota recovery, does not reorder phases or choose a lower-cost alias, creates no cross-process cache artifact, and produces no quota-dashboard artifact.
+
+- AC28 (R1): `--provider-config <path>` appears with that exact spelling and value shape in `--help` for adversarial-spec, adversarial-plan, adversarial-code-loop, and adversarial-code-review, and each entry point accepts the same valid configuration path for the precedence behavior in AC1.
