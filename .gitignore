@@ -5,3 +5,5 @@ __pycache__/
 
 .venv/
 *.py[cod]
+_retrospective/
+references/
