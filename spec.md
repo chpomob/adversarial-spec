@@ -176,22 +176,25 @@ dev:
 
 review:
   - alias: claude
-    cmd: "python3 /path/to/claude-tmux.py --yolo --model sonnet --timeout 600 --hard-timeout 1800 --cwd {workdir}"
+    cmd: "python3 /path/to/claude-tmux.py --model sonnet --timeout 600 --hard-timeout 1800 --cwd {workdir}"
     quota_check: --claude
     stop_threshold: 90       # skip if used_pct > 90%
+
+  - alias: glm
+    cmd: "pi -p --provider zai --model glm-5.2 --thinking high"
 
   - alias: deepseek
     cmd: "pi -p --provider deepseek --model deepseek-v4-pro --thinking high"
     quota_check: --deepseek
     stop_threshold: 2.0      # skip if balance < $2.00
 
-  - alias: glm
-    cmd: "pi -p --provider zai --model glm-5.2 --thinking high"
-
 challenger:
   - alias: claude
-    cmd: "python3 /path/to/claude-tmux.py --yolo --model sonnet --timeout 900 --hard-timeout 1800 --cwd {workdir}"
+    cmd: "python3 /path/to/claude-tmux.py --model sonnet --timeout 900 --hard-timeout 1800 --cwd {workdir}"
     quota_check: --claude
+
+  - alias: glm
+    cmd: "pi -p --provider zai --model glm-5.2 --thinking high"
 
   - alias: deepseek
     cmd: "pi -p --provider deepseek --model deepseek-v4-pro --thinking high"
