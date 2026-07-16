@@ -24,12 +24,24 @@ from pathlib import Path
 # inserts it on sys.path before importing us; the fallback below keeps the
 # package importable on its own (tests, REPL).
 try:
-    from adversarial_common import jsonio, persona_path, runner
+    from adversarial_common import (
+        NoProviderAvailable,
+        collect_provider_history,
+        jsonio,
+        persona_path,
+        runner,
+    )
     from adversarial_common.providers import enhance_cmd_for_project, persona_for_role
 except ImportError:  # pragma: no cover - exercised only on bare imports
     _COMMON = Path(__file__).resolve().parents[3] / "adversarial-common"
     sys.path.insert(0, str(_COMMON))
-    from adversarial_common import jsonio, persona_path, runner
+    from adversarial_common import (
+        NoProviderAvailable,
+        collect_provider_history,
+        jsonio,
+        persona_path,
+        runner,
+    )
     from adversarial_common.providers import enhance_cmd_for_project, persona_for_role
 from .phase_spec import validate_spec_file, validate_spec_text
 
@@ -38,6 +50,8 @@ __all__ = [
     "resolve_persona",
     "runtime_metadata",
     "merge_runtime",
+    "provider_history",
+    "raise_no_provider_available",
     "try_parse_json",
     "extract_frontmatter",
     "validate_spec_file",
@@ -95,6 +109,34 @@ def merge_runtime(*runtimes):
     merged["attempts"] = attempts
     merged["cap_events"] = cap_events
     return merged
+
+
+def provider_history(*results):
+    """Collect quota-provider decisions from calls in execution order."""
+    return collect_provider_history(list(results))
+
+
+def raise_no_provider_available(result, role, provider_results=None):
+    """Restore provider exhaustion represented by ``run_phase_cmd`` metadata.
+
+    ``provider_results`` may include earlier attempts from the same phase.  Its
+    ordered decisions are attached to the exception so a retry that exhausts
+    the provider chain does not discard successful calls made before it.
+    """
+    metadata = getattr(result, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return
+    snapshots = metadata.get("raw_snapshots")
+    reasons = metadata.get("rejection_reasons")
+    if not isinstance(snapshots, Mapping) or not isinstance(reasons, Mapping):
+        return
+    error = NoProviderAvailable(role, snapshots, reasons)
+    decision = metadata.get("provider_decision")
+    if isinstance(decision, Mapping):
+        error.provider_decision = dict(decision)
+    if provider_results is not None:
+        error.provider_history = provider_history(*provider_results)
+    raise error
 
 
 def run_role(cmd, prompt, role, timeout, cwd, phase=None, execution=None, ledger=None):

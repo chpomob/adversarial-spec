@@ -306,6 +306,18 @@ def _result_with_metadata(stdout="x", stderr="", code=0, metadata=None):
     return RunResult((stdout, stderr, code), metadata or {})
 
 
+def _provider_decision(phase, alias):
+    return {
+        "phase": phase,
+        "alias": alias,
+        "quota_state": "available" if alias else "unknown",
+        "fallback": False,
+        "forced": False,
+        "reason": "selected" if alias else "no provider available",
+        "raw_snapshot": {},
+    }
+
+
 def test_write_validation_failure_carries_execution(git_repo):
     # A1: the billed spec-writer call ran, then spec validation failed
     # (exit_code 2). Its execution/runtime evidence must still be attached.
@@ -348,6 +360,55 @@ def test_verify_retry_accumulates_attempt_metadata(tmp_path):
                                      run=_run)
     assert result["exit_code"] == 0
     assert [a["attempt"] for a in result["execution"]["attempts"]] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "phase_module,invoke,phase_name",
+    [
+        (
+            phase_challenge,
+            lambda path: phase_challenge.run_challenge(
+                "rev", str(path), 60
+            ),
+            "challenge",
+        ),
+        (
+            phase_verify,
+            lambda path: phase_verify.run_verify(
+                [{"id": "S1"}], "rev", str(path), 60, round_n=1
+            ),
+            "verify_1",
+        ),
+    ],
+)
+def test_json_retry_provider_exhaustion_carries_all_provider_decisions(
+        tmp_path, monkeypatch, phase_module, invoke, phase_name):
+    from adversarial_common import NoProviderAvailable
+
+    (tmp_path / "spec.md").write_text(VALID_SPEC)
+    first = _result_with_metadata(
+        "invalid JSON", metadata={
+            "provider_decision": _provider_decision(phase_name, "primary"),
+        }
+    )
+    second = _result_with_metadata(
+        "", "no provider", 3, metadata={
+            "provider_decision": _provider_decision(phase_name, None),
+            "raw_snapshots": {"primary": {"used_pct": 100}},
+            "rejection_reasons": {"primary": "quota exhausted"},
+        }
+    )
+    results = iter((first, second))
+    monkeypatch.setattr(
+        phase_module, "run_phase_cmd", lambda **_kwargs: next(results)
+    )
+
+    with pytest.raises(NoProviderAvailable) as raised:
+        invoke(tmp_path)
+
+    assert [
+        decision["alias"] for decision in raised.value.provider_history
+    ] == ["primary", None]
 
 
 def test_write_tags_cost_phase_as_write(git_repo):

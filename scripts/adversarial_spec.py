@@ -39,7 +39,7 @@ Exit codes:
                branch with --no-merge)
   1 infrastructure failure (phase crash, git error, interrupt)
   2 usage error (bad flags, missing/empty brief)
-  3 REJECT   — findings unresolved after max-loops
+  3 REJECT   — findings unresolved after max-loops, or no provider available
   5 CONTEXT_BLOCKED — brief failed the preflight gate before any provider/git
 
 The machine-readable contract is <out>/<feature>/final.json.
@@ -61,12 +61,24 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR.parent))
 sys.path.insert(0, str(_SCRIPTS_DIR.parent.parent / "adversarial-common"))
 
-from adversarial_common import CostLedger, gates, gitops, jsonio, report, runner
-from adversarial_common.providers import resolve_role_cmd
+from adversarial_common import (
+    CostLedger,
+    NoProviderAvailable,
+    ProviderConfigError,
+    QuotaResolver,
+    gates,
+    gitops,
+    jsonio,
+    load_provider_config,
+    report,
+    runner,
+)
+from adversarial_common.providers import enhance_cmd_for_project, resolve_role_cmd
 from scripts.phases import phase_challenge, phase_revise, phase_verify, phase_write
 from scripts.phases import (
     merge_runtime,
-    run_role,
+    provider_history,
+    resolve_persona,
     runtime_metadata,
     validate_spec_file,
 )
@@ -89,6 +101,8 @@ _THRESHOLD_ENV = {
     "min_chars": ("ASPEC_MIN_CONTEXT_CHARS", "ADVERSARIAL_MIN_CHARS"),
     "min_tokens": ("ASPEC_MIN_CONTEXT_TOKENS", "ADVERSARIAL_MIN_TOKENS"),
 }
+
+_FORCE_PROVIDER_ROLES = frozenset({"writer", "challenger", "verify"})
 
 
 # --- small helpers -------------------------------------------------------------
@@ -241,17 +255,23 @@ def _write_final_with_options(args, out_dir, verdict, **extra):
     the CI exit code is recorded inside the artifact, and the HTML report is
     rendered from the same bytes a caller will read back.
     """
+    ci_exit_override = extra.pop("_ci_exit_override", None)
     if getattr(args, "html", False):
         extra.setdefault("html_report", str(Path(out_dir) / "report.html"))
     if getattr(args, "ci", False):
         policy = runner.parse_fail_on(getattr(args, "fail_on", None))
-        exit_code = runner.ci_exit_code(
-            verdict,
-            findings=extra.get("findings", []),
-            fail_on_selector=getattr(args, "fail_on", None),
-            context_blocked=bool(extra.get("context_blocked"))
-            or verdict == "CONTEXT_BLOCKED",
-            infrastructure=verdict in {"ERROR", "INFRA"},
+        exit_code = (
+            ci_exit_override
+            if isinstance(ci_exit_override, int)
+            and not isinstance(ci_exit_override, bool)
+            else runner.ci_exit_code(
+                verdict,
+                findings=extra.get("findings", []),
+                fail_on_selector=getattr(args, "fail_on", None),
+                context_blocked=bool(extra.get("context_blocked"))
+                or verdict == "CONTEXT_BLOCKED",
+                infrastructure=verdict in {"ERROR", "INFRA"},
+            )
         )
         extra.setdefault("ci", {
             "enabled": True,
@@ -381,6 +401,50 @@ def _delegated_execution(delegated):
     return merge_runtime(*runtimes)
 
 
+def _delegated_provider_history(delegated):
+    """Collect provider decisions from delegated calls in execution order."""
+    results = []
+    if isinstance(delegated, dict):
+        decomposition = delegated.get("decomposition")
+        if isinstance(decomposition, dict):
+            results.append(decomposition.get("result"))
+        for worker in delegated.get("workers") or []:
+            if isinstance(worker, dict):
+                results.append(worker.get("result"))
+        synthesis = delegated.get("synthesis")
+        if isinstance(synthesis, dict):
+            results.append(synthesis.get("result"))
+    return provider_history(*results)
+
+
+def _run_delegated_role(args, cmd, prompt, cwd, phase):
+    """Run one delegated writer stage through the shared provider contract."""
+    resolver = getattr(args, "_provider_resolver", None)
+    selected_cmd = enhance_cmd_for_project(cmd, cwd) if cmd else cmd
+    explicit_cmd = selected_cmd if resolver is not None and selected_cmd else None
+    command_args = {}
+    if resolver is None:
+        command_args["cmd"] = selected_cmd
+    persona_cmd = explicit_cmd or (selected_cmd if resolver is None else "")
+    execution = _execution_settings(args)
+    return runner.run_phase_cmd(
+        phase_name=phase,
+        role="writer",
+        workdir=cwd,
+        resolver=resolver,
+        explicit_cmd=explicit_cmd,
+        force=bool(getattr(args, "force", False)),
+        force_provider=getattr(args, "_force_providers", {}).get("writer"),
+        stdin_text=prompt,
+        timeout=args.timeout,
+        persona="spec-writer",
+        persona_file=resolve_persona("spec-writer", persona_cmd),
+        ledger=args._ledger,
+        **command_args,
+        **execution,
+    )
+
+
 def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
                          complexity, state, out_dir):
     """Delegate spec writing for high-complexity briefs (R12, opt-in).
@@ -405,9 +469,6 @@ def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
         print(f"! {reason}; continuing with direct write", file=sys.stderr)
         return None
 
-    ledger = args._ledger
-    execution = _execution_settings(args)
-    timeout = args.timeout
     orchestrator_cmd = args.orchestrator_cmd or dev_cmd
     worker_cmd = args.worker_cmd or dev_cmd
     synth_cmd = args.synth_cmd or dev_cmd
@@ -439,10 +500,10 @@ def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
             "=== BRIEF ===",
             payload if isinstance(payload, str) else brief_text,
         ])
-        return partial(run_role, orchestrator_cmd, prompt, "spec-writer",
-                       timeout, _isolated_cwd("aspec-decompose-"),
-                       phase="delegated_decomposition",
-                       execution=execution, ledger=ledger)
+        return partial(
+            _run_delegated_role, args, orchestrator_cmd, prompt,
+            _isolated_cwd("aspec-decompose-"), "delegated_decomposition",
+        )
 
     def worker_call(task):
         prompt = "\n\n".join([
@@ -453,9 +514,10 @@ def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
             "=== FULL BRIEF ===",
             brief_text,
         ])
-        return partial(run_role, worker_cmd, prompt, "spec-writer", timeout,
-                       _isolated_cwd("aspec-worker-"), phase="delegated_worker",
-                       execution=execution, ledger=ledger)
+        return partial(
+            _run_delegated_role, args, worker_cmd, prompt,
+            _isolated_cwd("aspec-worker-"), "delegated_worker",
+        )
 
     def synthesis_call(survivors):
         sections = "\n\n".join(
@@ -469,9 +531,10 @@ def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
             "=== DELEGATED SECTIONS ===",
             sections,
         ])
-        return partial(run_role, synth_cmd, prompt, "spec-writer", timeout,
-                       workdir, phase="delegated_synthesis", execution=execution,
-                       ledger=ledger)
+        return partial(
+            _run_delegated_role, args, synth_cmd, prompt, workdir,
+            "delegated_synthesis",
+        )
 
     _banner("WRITE  (DELEGATED)")
     try:
@@ -485,6 +548,7 @@ def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
             shutil.rmtree(path, ignore_errors=True)
     state["delegated"] = _json_safe(delegated)
     _write_json(out_dir, "01_delegated.json", state["delegated"])
+    delegated_history = _delegated_provider_history(delegated)
 
     synthesis = delegated.get("synthesis") if isinstance(delegated, dict) else None
     if isinstance(delegated, dict) and delegated.get("status") == "synthesized" \
@@ -499,12 +563,14 @@ def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
                 "commit_sha": gitops.head_sha(workdir),
                 "stdout": synthesis.get("stdout", ""),
                 "execution": _delegated_execution(delegated),
+                "provider_history": delegated_history,
             }
         reason = f"delegated spec validation failed: {err}"
     else:
         status = delegated.get("status") if isinstance(delegated, dict) else None
         reason = (f"delegated synthesis did not complete "
                   f"(status={status!r}); falling back to direct write")
+    state.setdefault("provider_history", []).extend(delegated_history)
     _warn(state, "delegation_fallback", reason)
     print(f"! {reason}", file=sys.stderr)
     return None
@@ -564,6 +630,7 @@ def _preflight(args, brief_text, out_dir):
         findings=[],
         epistemic_labels=jsonio.epistemic_distribution([]),
         warnings=[],
+        provider_history=[],
     )
     print(f"X context blocked: {context['reason']}", file=sys.stderr)
     return effective_text, context, complexity, cap_events, False
@@ -586,9 +653,23 @@ def _record_phase(state, label, result, ledger):
     state.setdefault("cap_events", []).extend(
         {"phase": label, **event} for event in call["cap_events"])
     state["costs"] = ledger.summary()
+    history = result.get("provider_history", []) if isinstance(result, dict) else []
+    for decision in history:
+        if isinstance(decision, dict):
+            state.setdefault("provider_history", []).append(dict(decision))
     for warning in result.get("warnings", []) if isinstance(result, dict) else []:
         if warning not in state.setdefault("warnings", []):
             state["warnings"].append(warning)
+
+
+def _provider_call_args(args, role, explicit_cmd):
+    """Return quota controls for one provider-backed phase invocation."""
+    forced = getattr(args, "_force_providers", {})
+    return {
+        "explicit_cmd": explicit_cmd,
+        "force": bool(getattr(args, "force", False)),
+        "force_provider": forced.get(role),
+    }
 
 
 def _normalize_findings(findings, state=None):
@@ -734,6 +815,7 @@ def _finish(args, workdir, feature, out_dir, state, verdict, reason="", loops=0)
         "epistemic_labels": distribution,
         "epistemic_distribution": distribution,
         "warnings": state.get("warnings", []),
+        "provider_history": state.get("provider_history", []),
     }
     if state.get("research") is not None:
         final_extra["research"] = state["research"]
@@ -757,10 +839,7 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
     """Run the full workflow. Returns the process exit code."""
     ledger = args._ledger
     execution = _execution_settings(args)
-    # Bake retry/caps/ledger into a single run callable so every phase shares
-    # one cost ledger and identical execution controls. Phase-level schema
-    # retries (bad JSON) remain owned by each phase module.
-    runner_fn = partial(run_role, execution=execution, ledger=ledger)
+    resolver = getattr(args, "_provider_resolver", None)
 
     # PHASE 0 — GIT SETUP
     setup = _setup_git(workdir, feature, state)
@@ -777,8 +856,13 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
                                  state.get("complexity", {}), state, out_dir)
     if write is None:
         _banner("WRITE  (SPEC-WRITER)")
-        write = phase_write.run_write(brief_text, dev_cmd, workdir,
-                                      args.timeout, feature, run=runner_fn)
+        write = phase_write.run_write(
+            brief_text, dev_cmd, workdir, args.timeout, feature,
+            resolver=resolver,
+            execution=execution,
+            ledger=ledger,
+            **_provider_call_args(args, "writer", args.dev_cmd),
+        )
     _record_phase(state, "write", write, ledger)
     _write_json(out_dir, "01_write.json", write)
     if write["exit_code"] != 0:
@@ -791,8 +875,13 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
     # PHASE 2 — CHALLENGE
     _banner("CHALLENGE  (SPEC-CHALLENGER)")
     challenge = phase_challenge.run_challenge(
-        review_cmd, workdir, args.timeout, run=runner_fn,
-        branch_point=state["branch_point"])
+        review_cmd, workdir, args.timeout,
+        branch_point=state["branch_point"],
+        resolver=resolver,
+        execution=execution,
+        ledger=ledger,
+        **_provider_call_args(args, "challenger", args.review_cmd),
+    )
     # Assign stable finding ids and re-key the challenger's epistemic
     # warnings to those ids BEFORE recording/persisting: the shared parser
     # stamps each warning's finding_id from the raw id or the 0-based list
@@ -820,8 +909,13 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
         loops_run = n
 
         _banner(f"REVISE  (round {n}/{args.max_loops})")
-        revise = phase_revise.run_revise(findings, dev_cmd, workdir,
-                                         args.timeout, feature, n, run=runner_fn)
+        revise = phase_revise.run_revise(
+            findings, dev_cmd, workdir, args.timeout, feature, n,
+            resolver=resolver,
+            execution=execution,
+            ledger=ledger,
+            **_provider_call_args(args, "writer", args.dev_cmd),
+        )
         _record_phase(state, f"revise_{n}", revise, ledger)
         _write_json(out_dir, f"03_revise_{n}.json", revise)
         if revise["exit_code"] != 0:
@@ -829,8 +923,13 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
 
         _banner(f"VERIFY  (round {n}/{args.max_loops})")
         verify = phase_verify.run_verify(
-            findings, review_cmd, workdir, args.timeout, run=runner_fn,
-            branch_point=state["branch_point"], round_n=n)
+            findings, review_cmd, workdir, args.timeout,
+            branch_point=state["branch_point"], round_n=n,
+            resolver=resolver,
+            execution=execution,
+            ledger=ledger,
+            **_provider_call_args(args, "verify", args.review_cmd),
+        )
         _record_phase(state, f"verify_{n}", verify, ledger)
         _write_json(out_dir, f"04_verify_{n}.json", verify)
         if verify["exit_code"] != 0:
@@ -892,6 +991,29 @@ def _fail_on_arg(value):
     return value
 
 
+def _force_provider_value(value):
+    """argparse type for repeatable ``ROLE:ALIAS`` provider overrides."""
+    role, separator, alias = value.partition(":")
+    role = role.strip().lower()
+    alias = alias.strip()
+    if not separator or role not in _FORCE_PROVIDER_ROLES or not alias:
+        allowed = ", ".join(sorted(_FORCE_PROVIDER_ROLES))
+        raise argparse.ArgumentTypeError(
+            f"expected <role>:<alias> with role in: {allowed}"
+        )
+    return role, alias
+
+
+def _force_provider_map(values):
+    """Validate repeatable overrides and return one alias per role."""
+    result = {}
+    for role, alias in values:
+        if role in result:
+            raise ValueError(f"--force-provider specified more than once for {role}")
+        result[role] = alias
+    return result
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Adversarial Spec "
@@ -904,6 +1026,25 @@ def build_parser():
     p.add_argument("--review-cmd", default=None,
                    help=f"spec-challenger command (default: $ASPEC_REVIEW_CMD or "
                         f"'{DEFAULT_REVIEW_CMD}')")
+    p.add_argument(
+        "--provider-config",
+        default=None,
+        metavar="PATH",
+        help="provider registry YAML (env: ADVERSARIAL_PROVIDER_CONFIG)",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="skip quota checks and select each role's primary provider",
+    )
+    p.add_argument(
+        "--force-provider",
+        action="append",
+        default=[],
+        type=_force_provider_value,
+        metavar="ROLE:ALIAS",
+        help="force an alias for one role; repeat for multiple roles",
+    )
     p.add_argument("--workdir", default=".", help="Target directory (default: .)")
     p.add_argument("--max-loops", type=_positive_int, default=2)
     p.add_argument("--feature", default=None,
@@ -1001,6 +1142,27 @@ def _derive_feature(args, brief_text):
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
+    try:
+        args._force_providers = _force_provider_map(args.force_provider)
+        args._provider_config = load_provider_config(args.provider_config)
+        if args._provider_config is None:
+            args._provider_resolver = None
+        else:
+            if not args._provider_config.quota_cmd:
+                raise ProviderConfigError(
+                    "PROVIDER_CONFIG_QUOTA_CMD_REQUIRED",
+                    "quota_cmd is required when the spec pipeline uses a "
+                    "provider registry",
+                )
+            # One resolver owns quota caching and selection history for every
+            # phase and every schema retry in this process.
+            args._provider_resolver = QuotaResolver(
+                args._provider_config, args._provider_config.quota_cmd
+            )
+    except (ProviderConfigError, TypeError, ValueError) as exc:
+        print(f"X invalid provider configuration: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
     workdir = str(Path(args.workdir).resolve())
     if not os.path.isdir(workdir):
         print(f"X Workdir not found: {args.workdir}")
@@ -1052,17 +1214,30 @@ def main(argv=None):
         print(f"X {info}")
         return EXIT_INFRA
 
-    dev_cmd = resolve_role_cmd("dev", args.dev_cmd, "ASPEC_DEV_CMD",
-                               DEFAULT_DEV_CMD)
-    review_cmd = resolve_role_cmd("review", args.review_cmd, "ASPEC_REVIEW_CMD",
-                                  DEFAULT_REVIEW_CMD)
+    if args._provider_config is None:
+        dev_cmd = resolve_role_cmd(
+            "dev", args.dev_cmd, "ASPEC_DEV_CMD", DEFAULT_DEV_CMD
+        )
+        review_cmd = resolve_role_cmd(
+            "review", args.review_cmd, "ASPEC_REVIEW_CMD", DEFAULT_REVIEW_CMD
+        )
+    else:
+        # Registry commands are selected immediately before each phase.
+        # Non-empty CLI commands remain explicit quota-bypassing overrides.
+        dev_cmd = (args.dev_cmd or "").strip()
+        review_cmd = (args.review_cmd or "").strip()
 
     # R4 — one shared ledger accounts for every provider call across phases.
     args._ledger = CostLedger()
 
+    provider_mode = "registry" if args._provider_resolver is not None else "legacy"
+    command_banner = ""
+    if provider_mode == "legacy":
+        command_banner = (f"  WRITER: {dev_cmd[:60]}\n"
+                          f"  CHALLENGER: {review_cmd[:60]}\n")
     print(f"\n{'#' * 60}\n  ADVERSARIAL SPEC\n"
           f"  Feature: {feature}\n  Max loops: {args.max_loops}\n"
-          f"  WRITER: {dev_cmd[:60]}\n  CHALLENGER: {review_cmd[:60]}\n{'#' * 60}")
+          f"  Provider mode: {provider_mode}\n{command_banner}{'#' * 60}")
 
     state = {
         "context": context,
@@ -1075,6 +1250,7 @@ def main(argv=None):
         "warnings": [],
         "costs": args._ledger.summary(),
         "findings": [],
+        "provider_history": [],
     }
     # R10 — opt-in bounded external research, run after preflight succeeds.
     # Findings enrich the spec-writer's input; the record is persisted in
@@ -1096,6 +1272,54 @@ def main(argv=None):
         print("\nX Interrupted — restoring workdir (spec branch kept)")
         state["costs"] = args._ledger.summary()
         code = EXIT_INFRA
+    except NoProviderAvailable as exc:
+        print(f"X no provider available for role '{exc.role}'", file=sys.stderr)
+        aliases = set(exc.snapshots) | set(exc.reasons)
+        for alias in sorted(aliases):
+            snapshot = json.dumps(
+                exc.snapshots.get(alias, {}), sort_keys=True, default=str
+            )
+            reason = exc.reasons.get(alias, "ineligible")
+            print(
+                f"  {alias}: {reason}; snapshot={snapshot}", file=sys.stderr
+            )
+        history = getattr(exc, "provider_history", None)
+        if isinstance(history, list):
+            for decision in history:
+                if isinstance(decision, Mapping):
+                    state.setdefault("provider_history", []).append(
+                        dict(decision)
+                    )
+        else:
+            decision = getattr(exc, "provider_decision", None)
+            if isinstance(decision, Mapping):
+                state.setdefault("provider_history", []).append(dict(decision))
+        state["costs"] = args._ledger.summary()
+        _write_final_with_options(
+            args,
+            out_dir,
+            "REJECT",
+            status="provider_unavailable",
+            reason=str(exc),
+            error=str(exc),
+            branch=state.get("branch", ""),
+            merged=False,
+            context=state.get("context", context),
+            thresholds=state.get("thresholds", {}),
+            execution=state.get("execution", _execution_record(args)),
+            attempts=state.get("attempts", []),
+            cap_events=state.get("cap_events", []),
+            calls=state.get("calls", []),
+            costs=state["costs"],
+            complexity=state.get("complexity", complexity),
+            findings=state.get("findings", []),
+            warnings=state.get("warnings", []),
+            provider_history=state.get("provider_history", []),
+            provider_snapshots=_json_safe(exc.snapshots),
+            provider_reasons=dict(exc.reasons),
+            _ci_exit_override=EXIT_REJECTED,
+        )
+        code = EXIT_REJECTED
     except gitops.GitError as exc:
         print(f"\nX git error: {exc}")
         state["costs"] = args._ledger.summary()

@@ -8,7 +8,17 @@ stricter instruction on invalid JSON.
 """
 from pathlib import Path
 
-from . import run_role, runtime_metadata, try_parse_json, merge_runtime
+from adversarial_common import NoProviderAvailable, run_phase_cmd
+
+from . import (
+    enhance_cmd_for_project,
+    merge_runtime,
+    provider_history,
+    raise_no_provider_available,
+    resolve_persona,
+    runtime_metadata,
+    try_parse_json,
+)
 
 __all__ = ["run_challenge"]
 
@@ -54,7 +64,20 @@ def _build_prompt(branch_point=""):
     )
 
 
-def run_challenge(review_cmd, workdir, timeout, run=None, branch_point=""):
+def run_challenge(
+    review_cmd,
+    workdir,
+    timeout,
+    run=None,
+    branch_point="",
+    resolver=None,
+    *,
+    explicit_cmd=None,
+    force=False,
+    force_provider=None,
+    execution=None,
+    ledger=None,
+):
     """
     Run the spec-challenger against ``<workdir>/spec.md``.
 
@@ -62,20 +85,59 @@ def run_challenge(review_cmd, workdir, timeout, run=None, branch_point=""):
     "verdict": "..."}``; on failure ``{"phase": "challenge", "exit_code": 1,
     "error": "..."}``. *run* is injectable for tests.
     """
-    run = run or run_role
     try:
         spec_text = (Path(workdir) / "spec.md").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return {"phase": "challenge", "exit_code": 1,
                 "error": f"could not read spec.md: {exc}"}
 
-    prompt = _build_prompt(branch_point)
+    prompt = (
+        _build_prompt(branch_point)
+        + f"\n\n--- current spec.md ---\n{spec_text}"
+    )
     parse_warnings = []
+    provider_results = []
 
     def _attempt(prompt_text):
-        result = run(
-            review_cmd, prompt_text, "spec-challenger", timeout, workdir,
-            phase="challenge")
+        if run is not None:
+            result = run(
+                review_cmd, prompt_text, "spec-challenger", timeout, workdir,
+                phase="challenge",
+            )
+        else:
+            execution_args = dict(execution or {})
+            if ledger is not None:
+                execution_args["ledger"] = ledger
+            legacy_cmd = enhance_cmd_for_project(review_cmd, workdir)
+            selected_explicit = (
+                enhance_cmd_for_project(explicit_cmd, workdir)
+                if explicit_cmd is not None else None
+            )
+            command_args = {}
+            if resolver is None and explicit_cmd is None:
+                command_args["cmd"] = legacy_cmd
+            persona_cmd = selected_explicit or (
+                legacy_cmd if resolver is None else ""
+            )
+            result = run_phase_cmd(
+                phase_name="challenge",
+                role="challenger",
+                workdir=workdir,
+                resolver=resolver,
+                explicit_cmd=selected_explicit,
+                force=force,
+                force_provider=force_provider,
+                stdin_text=prompt_text,
+                timeout=timeout,
+                persona="spec-challenger",
+                persona_file=resolve_persona("spec-challenger", persona_cmd),
+                **command_args,
+                **execution_args,
+            )
+            provider_results.append(result)
+            raise_no_provider_available(
+                result, "challenger", provider_results=provider_results
+            )
         stdout, stderr, code = result[0], result[1], result[2]
         if code != 0:
             return None, f"CHALLENGE exited {code}: {(stderr or '')[:200]}", stdout, runtime_metadata(result)
@@ -85,7 +147,8 @@ def run_challenge(review_cmd, workdir, timeout, run=None, branch_point=""):
         payload, err, stdout, runtime = _attempt(prompt)
         if err:
             return {"phase": "challenge", "exit_code": 1, "error": err,
-                    "stdout": stdout, "execution": runtime}
+                    "stdout": stdout, "execution": runtime,
+                    "provider_history": provider_history(*provider_results)}
         if not _validate(payload):
             prev_runtime = runtime
             payload, err, stdout, runtime = _attempt(
@@ -96,13 +159,15 @@ def run_challenge(review_cmd, workdir, timeout, run=None, branch_point=""):
             runtime = merge_runtime(prev_runtime, runtime)
             if err:
                 return {"phase": "challenge", "exit_code": 1, "error": err,
-                        "stdout": stdout, "execution": runtime}
+                        "stdout": stdout, "execution": runtime,
+                        "provider_history": provider_history(*provider_results)}
             if not _validate(payload):
                 return {
                     "phase": "challenge", "exit_code": 1,
                     "findings": [], "verdict": "UNKNOWN",
                     "error": "invalid JSON after retry", "stdout": stdout,
                     "execution": runtime,
+                    "provider_history": provider_history(*provider_results),
                 }
         return {
             "phase": "challenge", "exit_code": 0,
@@ -112,6 +177,9 @@ def run_challenge(review_cmd, workdir, timeout, run=None, branch_point=""):
             "warnings": parse_warnings,
             "stdout": stdout,
             "execution": runtime,
+            "provider_history": provider_history(*provider_results),
         }
+    except NoProviderAvailable:
+        raise
     except Exception as exc:  # defensive: never leak an exception to the loop
         return {"phase": "challenge", "exit_code": 1, "error": str(exc)}

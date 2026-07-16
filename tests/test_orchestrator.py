@@ -93,6 +93,24 @@ def test_parser_defaults():
     assert args.timeout == 600
     assert args.out == ".adversarial-spec"
     assert args.no_merge is False
+    assert args.provider_config is None
+    assert args.force is False
+    assert args.force_provider == []
+
+
+def test_parser_accepts_provider_controls():
+    args = orch.build_parser().parse_args([
+        "--provider-config", "providers.yaml",
+        "--force",
+        "--force-provider", "writer:codex",
+        "--force-provider", "verify:claude",
+    ])
+    assert args.provider_config == "providers.yaml"
+    assert args.force is True
+    assert orch._force_provider_map(args.force_provider) == {
+        "writer": "codex",
+        "verify": "claude",
+    }
 
 
 def test_derive_feature_prefers_flag_then_brief_filename():
@@ -175,6 +193,294 @@ def _git(workdir, *args):
                           capture_output=True, text=True, check=True).stdout
 
 
+def _provider_config(tmp_path, writer_cmd, reviewer_cmd, snapshots):
+    checker = tmp_path / "quota-checker.py"
+    checker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        f"print(json.dumps({snapshots!r}))\n"
+    )
+    checker.chmod(0o755)
+    config = tmp_path / "providers.yaml"
+    config.write_text(textwrap.dedent(f"""\
+        quota_cmd: {json.dumps(str(checker))}
+        quota_cache_ttl: 0
+        roles:
+          writer:
+            - alias: writer-provider
+              cmd: {json.dumps(writer_cmd)}
+              quota_check: writer
+          challenger:
+            - alias: challenger-provider
+              cmd: {json.dumps(reviewer_cmd)}
+              quota_check: challenger
+          verify:
+            - alias: verify-provider
+              cmd: {json.dumps(reviewer_cmd)}
+              quota_check: verify
+    """))
+    return config
+
+
+def _registry_pipeline(
+    tmp_path, snapshots, extra_args=(), reviewer_source=APPROVE_REVIEWER,
+    writer_source=None, brief_text=None,
+):
+    workdir = tmp_path / "registry-project"
+    workdir.mkdir()
+    writer = tmp_path / "registry-writer.py"
+    writer.write_text(writer_source or WRITER_SCRIPT.format(spec=VALID_SPEC))
+    reviewer = tmp_path / "registry-reviewer.py"
+    reviewer.write_text(reviewer_source)
+    config = _provider_config(
+        tmp_path,
+        f"python3 {writer}",
+        f"python3 {reviewer}",
+        snapshots,
+    )
+    brief = tmp_path / "registry-feature.md"
+    brief.write_text(
+        brief_text
+        or "# Registry feature\n\nUsers need provider routing coverage.\n"
+    )
+    code = orch.main([
+        "--brief", str(brief),
+        "--workdir", str(workdir),
+        "--provider-config", str(config),
+        "--max-loops", "1",
+        "--timeout", "60",
+        *extra_args,
+    ])
+    final_path = (
+        workdir / ".adversarial-spec" / "registry-feature" / "final.json"
+    )
+    return workdir, code, json.loads(final_path.read_text())
+
+
+def test_registry_routes_write_and_challenge_and_records_history(tmp_path):
+    _, code, final = _registry_pipeline(tmp_path, {
+        "writer-provider": {"used_pct": 1},
+        "challenger-provider": {"used_pct": 1},
+        "verify-provider": {"used_pct": 1},
+    })
+    assert code == orch.EXIT_APPROVED
+    assert [item["phase"] for item in final["provider_history"]] == [
+        "write", "challenge"
+    ]
+    assert [item["alias"] for item in final["provider_history"]] == [
+        "writer-provider", "challenger-provider"
+    ]
+
+
+def test_registry_routes_every_delegated_stage_through_writer(tmp_path):
+    branching_writer = textwrap.dedent("""\
+        import json, pathlib, sys
+        prompt = sys.stdin.read()
+        if "Decompose this specification" in prompt:
+            print(json.dumps({"tasks": [
+                {"id": "requirements", "scope": "requirements"},
+                {"id": "acceptance", "scope": "acceptance"}]}))
+        elif "Draft the specification section" in prompt:
+            print("## Delegated section\\n\\nContent for this scope.")
+        elif "Merge the delegated spec sections" in prompt:
+            pathlib.Path("spec.md").write_text(%r)
+            print("spec.md written")
+    """ % VALID_SPEC)
+    high_brief = "# Registry feature\n\n" + "".join(
+        f"R{number}: requirement number {number} for the platform.\n"
+        for number in range(1, 80)
+    )
+    _, code, final = _registry_pipeline(
+        tmp_path,
+        {
+            "writer-provider": {"used_pct": 1},
+            "challenger-provider": {"used_pct": 1},
+            "verify-provider": {"used_pct": 1},
+        },
+        extra_args=("--delegated",),
+        writer_source=branching_writer,
+        brief_text=high_brief,
+    )
+    assert code == orch.EXIT_APPROVED
+    assert final["delegated"]["status"] == "synthesized"
+    phases = [item["phase"] for item in final["provider_history"]]
+    assert phases == [
+        "delegated_decomposition",
+        "delegated_worker",
+        "delegated_worker",
+        "delegated_synthesis",
+        "challenge",
+    ]
+    assert [item["alias"] for item in final["provider_history"][:-1]] == [
+        "writer-provider",
+        "writer-provider",
+        "writer-provider",
+        "writer-provider",
+    ]
+
+
+def test_registry_routes_revise_to_writer_and_verify_to_verify(tmp_path):
+    _, code, final = _registry_pipeline(
+        tmp_path,
+        {
+            "writer-provider": {"used_pct": 1},
+            "challenger-provider": {"used_pct": 1},
+            "verify-provider": {"used_pct": 1},
+        },
+        reviewer_source=FINDINGS_REVIEWER,
+    )
+    assert code == orch.EXIT_APPROVED
+    assert [item["phase"] for item in final["provider_history"]] == [
+        "write", "challenge", "revise_1", "verify_1"
+    ]
+    assert [item["alias"] for item in final["provider_history"]] == [
+        "writer-provider", "challenger-provider",
+        "writer-provider", "verify-provider",
+    ]
+
+
+def test_explicit_dev_cmd_bypasses_writer_quota_only(tmp_path):
+    explicit_writer = tmp_path / "explicit-writer.py"
+    explicit_writer.write_text(WRITER_SCRIPT.format(spec=VALID_SPEC))
+    _, code, final = _registry_pipeline(
+        tmp_path,
+        {
+            "writer-provider": {"used_pct": 100},
+            "challenger-provider": {"used_pct": 1},
+            "verify-provider": {"used_pct": 1},
+        },
+        extra_args=("--dev-cmd", f"python3 {explicit_writer}"),
+    )
+    assert code == orch.EXIT_APPROVED
+    assert [item["phase"] for item in final["provider_history"]] == [
+        "challenge"
+    ]
+
+
+def test_explicit_review_cmd_bypasses_challenger_and_verify_quota(tmp_path):
+    explicit_review_cmd = f"python3 {tmp_path / 'registry-reviewer.py'}"
+    _, code, final = _registry_pipeline(
+        tmp_path,
+        {
+            "writer-provider": {"used_pct": 1},
+            "challenger-provider": {"used_pct": 100},
+            "verify-provider": {"used_pct": 100},
+        },
+        extra_args=("--review-cmd", explicit_review_cmd),
+        reviewer_source=FINDINGS_REVIEWER,
+    )
+    assert code == orch.EXIT_APPROVED
+    assert [item["phase"] for item in final["provider_history"]] == [
+        "write", "revise_1"
+    ]
+
+
+def test_force_skips_quota_and_marks_provider_history(tmp_path):
+    _, code, final = _registry_pipeline(
+        tmp_path,
+        {
+            "writer-provider": {"used_pct": 100},
+            "challenger-provider": {"used_pct": 100},
+            "verify-provider": {"used_pct": 100},
+        },
+        extra_args=("--force",),
+    )
+    assert code == orch.EXIT_APPROVED
+    assert all(item["forced"] for item in final["provider_history"])
+
+
+def test_no_provider_exits_three_with_snapshots(tmp_path, capsys):
+    _, code, final = _registry_pipeline(
+        tmp_path,
+        {
+            "writer-provider": {"used_pct": 100},
+            "challenger-provider": {"used_pct": 1},
+            "verify-provider": {"used_pct": 1},
+        },
+        extra_args=("--ci",),
+    )
+    assert code == 3
+    assert final["ci"]["exit_code"] == 3
+    assert final["status"] == "provider_unavailable"
+    assert final["provider_snapshots"]["writer-provider"]["used_pct"] == 100
+    assert final["provider_history"][0]["phase"] == "write"
+    assert "snapshot=" in capsys.readouterr().err
+
+
+def test_verify_retry_exhaustion_preserves_first_decision_in_final(tmp_path):
+    workdir = tmp_path / "retry-exhaustion-project"
+    workdir.mkdir()
+    marker = tmp_path / "first-verify-completed"
+    writer = tmp_path / "retry-exhaustion-writer.py"
+    writer.write_text(WRITER_SCRIPT.format(spec=VALID_SPEC))
+    reviewer = tmp_path / "retry-exhaustion-reviewer.py"
+    reviewer.write_text(textwrap.dedent(f"""\
+        import json, pathlib, sys
+        prompt = sys.stdin.read()
+        if "For each finding" in prompt:
+            pathlib.Path({str(marker)!r}).write_text("done")
+            print("invalid JSON")
+        else:
+            print(json.dumps({{
+                "findings": [{{"id": "S1", "severity": "major",
+                              "section": "Requirements",
+                              "summary": "R1 untestable", "evidence": "R1"}}],
+                "verdict": "REQUEST_CHANGES", "summary": "1 major"}}))
+    """))
+    checker = tmp_path / "retry-exhaustion-quota.py"
+    checker.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env python3
+        import json, pathlib
+        exhausted = pathlib.Path({str(marker)!r}).exists()
+        print(json.dumps({{
+            "writer-provider": {{"used_pct": 1}},
+            "challenger-provider": {{"used_pct": 1}},
+            "verify-provider": {{"used_pct": 100 if exhausted else 1}},
+        }}))
+    """))
+    checker.chmod(0o755)
+    config = tmp_path / "retry-exhaustion-providers.yaml"
+    config.write_text(textwrap.dedent(f"""\
+        quota_cmd: {json.dumps(str(checker))}
+        quota_cache_ttl: 0
+        roles:
+          writer:
+            - alias: writer-provider
+              cmd: {json.dumps(f'python3 {writer}')}
+              quota_check: writer
+          challenger:
+            - alias: challenger-provider
+              cmd: {json.dumps(f'python3 {reviewer}')}
+              quota_check: challenger
+          verify:
+            - alias: verify-provider
+              cmd: {json.dumps(f'python3 {reviewer}')}
+              quota_check: verify
+    """))
+    brief = tmp_path / "retry-exhaustion.md"
+    brief.write_text("# Retry exhaustion\n\nVerify provider history retention.\n")
+
+    code = orch.main([
+        "--brief", str(brief),
+        "--workdir", str(workdir),
+        "--provider-config", str(config),
+        "--max-loops", "1",
+        "--timeout", "60",
+    ])
+
+    final = json.loads((
+        workdir / ".adversarial-spec" / "retry-exhaustion" / "final.json"
+    ).read_text())
+    assert code == orch.EXIT_REJECTED
+    assert final["status"] == "provider_unavailable"
+    assert [item["phase"] for item in final["provider_history"]] == [
+        "write", "challenge", "revise_1", "verify_1", "verify_1",
+    ]
+    assert [item["alias"] for item in final["provider_history"][-2:]] == [
+        "verify-provider", None,
+    ]
+
+
 def test_pipeline_approved_squash_merges(tmp_path):
     workdir, code = _scripted_pipeline(tmp_path, APPROVE_REVIEWER)
     assert code == orch.EXIT_APPROVED
@@ -187,6 +493,20 @@ def test_pipeline_approved_squash_merges(tmp_path):
         (workdir / ".adversarial-spec" / "demo-feature" / "final.json").read_text())
     assert final["verdict"] == "APPROVED"
     assert final["merged"] is True
+
+
+def test_legacy_banner_prints_resolved_writer_and_challenger_commands(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(orch, "load_provider_config", lambda _path: None)
+    _workdir, code = _scripted_pipeline(tmp_path, APPROVE_REVIEWER)
+    assert code == orch.EXIT_APPROVED
+    output = capsys.readouterr().out
+    assert "  Provider mode: legacy\n" in output
+    writer_cmd = f"python3 {tmp_path / 'writer.py'}"
+    reviewer_cmd = f"python3 {tmp_path / 'reviewer.py'}"
+    assert f"  WRITER: {writer_cmd[:60]}\n" in output
+    assert f"  CHALLENGER: {reviewer_cmd[:60]}\n" in output
 
 
 def test_pipeline_rejected_leaves_marker(tmp_path):
