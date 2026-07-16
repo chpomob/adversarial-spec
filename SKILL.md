@@ -1,7 +1,7 @@
 ---
 name: adversarial-spec
 description: "Adversarial specification writer. Takes a brief (from grill-me or user) and produces a structured spec.md with YAML frontmatter, requirements, acceptance criteria, and target files. Git-aware pipeline: each run on its own branch, squash-merge on approval."
-version: 1.0.0
+version: 1.1.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos]
@@ -33,13 +33,14 @@ MERGE  ──→ squash-merge (APPROVED) or [REJECTED] commit
 ```bash
 python3 scripts/adversarial_spec.py \
   --brief <file>           # brief file (default: stdin)
-  --dev-cmd <cmd>          # spec-writer (default: pi ... glm-5.2)
-  --review-cmd <cmd>       # spec-challenger (default: pi ... deepseek)
+  --dev-cmd <cmd>          # spec-writer command (default: pi ... glm-5.2)
+  --review-cmd <cmd>       # spec-challenger command (default: pi ... deepseek)
   --workdir <dir>          # default: .
   --max-loops <N>          # default: 2
   --feature <name>         # default: from brief filename
   --timeout <N>            # default: 600
   --out <dir>              # default: .adversarial-spec
+  --provider-config <path> # external provider config (default: ~/.config/adversarial/providers.yaml)
   --no-merge
 ```
 
@@ -103,14 +104,35 @@ English unless the user explicitly instructs otherwise. A spec written in French
 other non-English languages will break later pipeline stages (plan, code loop) that
 expect English section headings and identifiers.
 
-## Model pairing rules
+## Provider selection — external config, not hardcoded
 
-- **Writer and challenger MUST be different models** (never the same model for both roles).
-- **Preferred pairing:** Codex (writer) + Claude Fable 5 via tmux (challenger).
-- **Fallback when Claude quota low / timeout:** GLM-5.2 via `pi -p --provider zai --model glm-5.2 --thinking high` (challenger).
-- **Fallback when Codex quota low / no API:** GLM-5.2 via `pi` (writer).
-- **DeepSeek is NOT a fallback for spec-challenger unless explicitly requested.**
-  The user prefers Claude or GLM for this role.
+**The pipeline does not know what models exist.** It only knows **roles** (writer,
+challenger). Which command fills each role is defined in an external provider config
+file, loaded via `--provider-config`:
+
+```bash
+python3 scripts/adversarial_spec.py \
+  --brief brief.md \
+  --provider-config ~/.config/adversarial/providers.yaml
+```
+
+The provider config is a YAML file where each role lists commands in preference order.
+The pipeline checks real-time quota before each phase and picks the first available command.
+This means:
+
+- **Writer and challenger MUST be different models** — enforced by config, not by the code.
+  The pipeline refuses to run the same alias for both roles (same-model debate is
+  pointless).
+- **No model names appear anywhere in the pipeline code or SKILL.md.** The user's
+  preferred provider chain (Claude, Codex, GLM, DeepSeek, or any other) lives in
+  their personal `~/.config/adversarial/providers.yaml`, not in the skill.
+- **Fallback chains are the user's choice**, not built-in defaults. If Claude is
+  primary and GLM is fallback, that's in the user's config. If they switch to Gemini
+  + OpenRouter next month, they change one file — no code changes.
+
+The provider config also feeds `--dev-cmd` and `--review-cmd` defaults. When these
+CLI flags are passed explicitly, they override the config for that role (backward
+compatible).
 
 ## Prompt design
 
@@ -120,7 +142,7 @@ expect English section headings and identifiers.
   design principle that context lives on disk / in git.
 - The challenge prompt should be under ~2K chars: "Challenge the specification at
   \`spec.md\` against its brief at \`brief.md\` (both in the current directory).
-  Output ONLY valid JSON: {"findings": [...], "verdict": "..."}"
+  Output ONLY valid JSON: {\"findings\": [...], \"verdict\": \"...\"}"
 - **Fixed 2026-07-15:** `scripts/phases/phase_challenge.py` previously
   concatenated the full spec text into the prompt (`f"--- spec.md ---\n{spec_text}"`)
   despite the SKILL.md saying not to. Patched to ~637 chars with no embedding.
@@ -136,10 +158,14 @@ expect English section headings and identifiers.
 - The spec-writer writes to disk (spec.md), not stdout. The challenger reads from disk.
 - YAML frontmatter is validated: name, version, author, targets are required.
 - The same code patterns as adversarial-code-loop v4: git branch isolation, phase modules, squash merge.
-- **Claude Fable 5 (2026-07) IS reliable as spec-challenger.** Validated: 11 findings, REQUEST_CHANGES → REVISE → APPROVE (11/11 settled), all valid JSON. Use `--review-cmd "python3 /path/to/claude-tmux.py --yolo --model best --timeout 600 --hard-timeout 1800"` with `--timeout 1800`. (600s timeout is insufficient for Fable 5 extended thinking.)
-- **Codex pipe-stdin + reasoning=high can stall 2-4 min** before producing output. Process stays running — not a crash. If stalled >5 min, switch `--dev-cmd` to `reasoning=medium`.
-- **Fallback when Claude fails:** DeepSeek (`pi --provider deepseek --model deepseek-v4-pro`) or GLM-5.2 (`pi -p --provider zai --model glm-5.2 --thinking high`). Both output clean JSON reliably.
-- **Validated pairing (2026-07): Codex DEV + Claude REVIEW** across all 3 stages (spec, plan, code loop). All in 1 cycle.
+- **Never hardcode model-specific fallback chains in a spec.** Provider selection is
+  purely configuration-driven. A spec that references "Claude", "Codex", or any model
+  by name in its requirements or acceptance criteria creates an implicit dependency on
+  specific providers and breaks when the user's lineup changes. The spec describes
+  *what* to build — the *who* (which model builds it) belongs in the provider config.
+- **Never list model-specific commands in a spec's targets.** The `cmd:` field in
+  target file descriptions should describe the change ("add YAML config loader",
+  "expose ProviderConfig dataclass"), not the tool that makes it.
 - **Pre-existing PR review feedback shapes the brief.** When the user already has an open PR with reviewer comments (e.g. hermes-sweeper, teknium1), read the full review before writing the brief. The spec must explicitly address each review finding so the pipeline doesn't re-propose code the reviewer already rejected. Document the review verdict and each finding in the brief's context section. The spec-challenger will independently validate the approach, which serves as a second opinion on whether the review feedback was correctly interpreted.
 - **Requirement ID format is regex-constrained.** The validation regex expects `R1:` or `R1-` (colon or hyphen after the ID). `R1 (P0) —` or `R1 —` with em dash will NOT match — shows "Requirements section has no identifiable requirement ids". Always write requirements as `- R1: description` or `- R1 - description`. The em dash `—` is not in the regex lookahead set.
 - **Acceptance criteria format similarly constrained.** The regex expects `AC1 (R1):` at the start of a bullet line. No space between `)` and `:`. Wrong: `- AC1 (R1) : text`. Right: `- AC1 (R1): text`.
