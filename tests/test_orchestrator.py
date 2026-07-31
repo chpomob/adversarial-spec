@@ -1,12 +1,64 @@
 """Orchestrator unit tests + end-to-end pipeline tests with scripted CLIs."""
 import json
+import re
 import subprocess
 import textwrap
+from pathlib import Path
 
 import pytest
 
 from conftest import VALID_SPEC
 from scripts import adversarial_spec as orch
+from scripts.phases import phase_spec
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+# --- documentation invariants --------------------------------------------------
+
+def test_skill_provider_defaults_and_context_blocked_exit_are_honest():
+    skill = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "No model names appear anywhere in the pipeline code or SKILL.md" not in skill
+    assert f"`{orch.DEFAULT_DEV_CMD}`" in skill
+    assert f"`{orch.DEFAULT_REVIEW_CMD}`" in skill
+    assert orch.EXIT_CONTEXT_BLOCKED == 5
+    assert re.search(
+        rf"^\|\s*{orch.EXIT_CONTEXT_BLOCKED}\s*\|[^\n]*\bCONTEXT_BLOCKED\b",
+        skill,
+        re.MULTILINE,
+    )
+
+
+def test_readme_output_example_satisfies_required_frontmatter_fields():
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    match = re.search(r"```yaml\s*\n(?P<example>.*?)```", readme, re.DOTALL)
+
+    assert match is not None
+    example = match.group("example")
+    assert "author" in phase_spec._REQUIRED_SCALARS
+    for field in phase_spec._REQUIRED_SCALARS:
+        assert re.search(rf"^{re.escape(field)}\s*:", example, re.MULTILINE)
+    assert phase_spec.validate_spec_text(example) == (True, "")
+
+
+def test_fenced_commands_do_not_use_claude_tmux_yolo_flag():
+    command_languages = {"bash", "console", "sh", "shell", "zsh"}
+
+    for filename in ("SKILL.md", "README.md"):
+        markdown = (PROJECT_ROOT / filename).read_text(encoding="utf-8")
+        fences = re.finditer(
+            r"^```(?P<language>[^\n]*)\n(?P<body>.*?)^```\s*$",
+            markdown,
+            re.MULTILINE | re.DOTALL,
+        )
+        command_bodies = [
+            match.group("body")
+            for match in fences
+            if match.group("language").strip().casefold() in command_languages
+        ]
+        assert all("--yolo" not in body for body in command_bodies), filename
 
 
 # --- helpers -------------------------------------------------------------------

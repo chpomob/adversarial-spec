@@ -33,8 +33,8 @@ MERGE  ──→ squash-merge (APPROVED) or [REJECTED] commit
 ```bash
 python3 scripts/adversarial_spec.py \
   --brief <file>           # brief file (default: stdin)
-  --dev-cmd <cmd>          # spec-writer command (default: pi ... glm-5.2)
-  --review-cmd <cmd>       # spec-challenger command (default: pi ... deepseek)
+  --dev-cmd <cmd>          # default: pi --provider zai --model glm-5.2
+  --review-cmd <cmd>       # default: pi --provider deepseek --model deepseek-v4-pro
   --workdir <dir>          # default: .
   --max-loops <N>          # default: 2
   --feature <name>         # default: from brief filename
@@ -95,6 +95,7 @@ Loaded from adversarial-common/personas/:
 | 1 | Infrastructure failure |
 | 2 | Usage error |
 | 3 | REJECT |
+| 5 | CONTEXT_BLOCKED — CI/preflight context gate rejected the brief |
 
 ## Language discipline
 
@@ -104,11 +105,12 @@ English unless the user explicitly instructs otherwise. A spec written in French
 other non-English languages will break later pipeline stages (plan, code loop) that
 expect English section headings and identifiers.
 
-## Provider selection — external config, not hardcoded
+## Provider selection — registry, explicit commands, then fallbacks
 
-**The pipeline does not know what models exist.** It only knows **roles** (writer,
-challenger). Which command fills each role is defined in an external provider config
-file, loaded via `--provider-config`:
+Provider-mode precedence is `--provider-config` (or the
+`ADVERSARIAL_PROVIDER_CONFIG`/implicit default registry) > explicit role flags >
+hardcoded fallback commands. A selected registry supplies the writer and challenger
+chains and enables quota-aware selection:
 
 ```bash
 python3 scripts/adversarial_spec.py \
@@ -118,21 +120,24 @@ python3 scripts/adversarial_spec.py \
 
 The provider config is a YAML file where each role lists commands in preference order.
 The pipeline checks real-time quota before each phase and picks the first available command.
+Within registry mode, a non-empty `--dev-cmd` or `--review-cmd` is an explicit,
+quota-bypassing override for that role. Without a registry, each role resolves its
+command from the explicit flag, then `ASPEC_DEV_CMD`/`ASPEC_REVIEW_CMD`, then these
+hardcoded fallbacks:
+
+- Writer: `pi --provider zai --model glm-5.2`
+- Challenger: `pi --provider deepseek --model deepseek-v4-pro`
+
 This means:
 
 - **Writer and challenger MUST be different models** — enforced by config, not by the code.
   The pipeline refuses to run the same alias for both roles (same-model debate is
   pointless).
-- **No model names appear anywhere in the pipeline code or SKILL.md.** The user's
-  preferred provider chain (Claude, Codex, GLM, DeepSeek, or any other) lives in
-  their personal `~/.config/adversarial/providers.yaml`, not in the skill.
-- **Fallback chains are the user's choice**, not built-in defaults. If Claude is
-  primary and GLM is fallback, that's in the user's config. If they switch to Gemini
-  + OpenRouter next month, they change one file — no code changes.
-
-The provider config also feeds `--dev-cmd` and `--review-cmd` defaults. When these
-CLI flags are passed explicitly, they override the config for that role (backward
-compatible).
+- **Configured fallback chains remain the user's choice.** The commands above are
+  legacy fallbacks only when no registry or role-specific command is available.
+- **Explicit role commands remain backward compatible.** In registry mode they
+  override that role's selected provider; in legacy mode they take precedence over
+  the environment and hardcoded command.
 
 ## Prompt design
 

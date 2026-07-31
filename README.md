@@ -20,6 +20,7 @@ MERGE  ──→ squash-merge (APPROVED) or [REJECTED] commit
 ---
 name: "feature-name"
 version: "1.0"
+author: "adversarial-spec"
 status: "draft"
 targets:
   - file: path/to/file
