@@ -145,9 +145,10 @@ compatible).
   Output ONLY valid JSON: {\"findings\": [...], \"verdict\": \"...\"}"
 - **Fixed 2026-07-15:** `scripts/phases/phase_challenge.py` previously
   concatenated the full spec text into the prompt (`f"--- spec.md ---\n{spec_text}"`)
-  despite the SKILL.md saying not to. Patched to ~637 chars with no embedding.
-  The model reads spec.md from disk via `--cwd`. See `adversarial-plan` pitfall
-  about CHALLENGE prompt reduction for the sibling fix.
+  despite the SKILL.md saying not to. Patched to an under-1KB instruction with
+  no embedding; its size is independent of the spec length. The model reads
+  spec.md from disk via `--cwd`. See `adversarial-plan` pitfall about CHALLENGE
+  prompt reduction for the sibling fix.
 - If the claude-tmux wrapper is used as challenger, ensure `--cwd` points to the
   workdir so the model can read the files. Without `--cwd`, the tmux session
   starts in the wrong directory and the model cannot find plan.md/spec.md.

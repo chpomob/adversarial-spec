@@ -1,10 +1,9 @@
 """
-CHALLENGE phase: the spec-challenger model reviews ``spec.md``.
+CHALLENGE phase: the spec-challenger model reviews ``spec.md`` from disk.
 
-The spec text is embedded in the prompt (model-agnostic: works even for
-providers without file access) and the file is also on disk for providers
-that can read it. Output is validated JSON findings; one retry with a
-stricter instruction on invalid JSON.
+The prompt directs the provider to the file in its working directory instead
+of embedding the spec text. Output is validated JSON findings; one retry with
+a stricter instruction on invalid JSON.
 """
 from pathlib import Path
 
@@ -86,15 +85,15 @@ def run_challenge(
     "error": "..."}``. *run* is injectable for tests.
     """
     try:
-        spec_text = (Path(workdir) / "spec.md").read_text(encoding="utf-8")
+        # Fail before invoking a provider if the on-disk input is unavailable.
+        # Do not append this content to the prompt: the challenger reads the
+        # file from ``workdir``.
+        (Path(workdir) / "spec.md").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return {"phase": "challenge", "exit_code": 1,
                 "error": f"could not read spec.md: {exc}"}
 
-    prompt = (
-        _build_prompt(branch_point)
-        + f"\n\n--- current spec.md ---\n{spec_text}"
-    )
+    prompt = _build_prompt(branch_point)
     parse_warnings = []
     provider_results = []
 

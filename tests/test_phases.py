@@ -165,18 +165,37 @@ def test_challenge_rejects_bad_severity(tmp_path):
     assert result["exit_code"] == 1
 
 
-def test_challenge_spec_embedded_in_prompt(tmp_path):
-    (tmp_path / "spec.md").write_text(VALID_SPEC)
+def test_challenge_reads_spec_from_disk_without_embedding_it(tmp_path):
+    spec_path = tmp_path / "spec.md"
+    short_spec = "UNIQUE_SHORT_SPEC_CONTENT"
+    long_spec = "UNIQUE_LONG_SPEC_CONTENT" * 1_000
     calls = []
     branch_point = "0123456789abcdef"
+
+    spec_path.write_text(short_spec)
     phase_challenge.run_challenge(
         "rev", str(tmp_path), 60,
         run=fake_run(stdout=CHALLENGE_OK, calls=calls),
         branch_point=branch_point)
-    assert "demo-feature" in calls[0]["prompt"]
-    assert branch_point in calls[0]["prompt"]
-    assert "HEAD~1" not in calls[0]["prompt"]
-    assert calls[0]["role"] == "spec-challenger"
+
+    spec_path.write_text(long_spec)
+    phase_challenge.run_challenge(
+        "rev", str(tmp_path), 60,
+        run=fake_run(stdout="not json", calls=calls),
+        branch_point=branch_point)
+
+    base_prompt = phase_challenge._build_prompt(branch_point)
+    assert calls[0]["prompt"] == base_prompt
+    assert calls[1]["prompt"] == base_prompt
+    assert calls[2]["prompt"].startswith(base_prompt)
+    for call in calls:
+        assert short_spec not in call["prompt"]
+        assert long_spec not in call["prompt"]
+        assert "--- spec.md ---" not in call["prompt"]
+        assert "--- current spec.md ---" not in call["prompt"]
+        assert branch_point in call["prompt"]
+        assert "HEAD~1" not in call["prompt"]
+        assert call["role"] == "spec-challenger"
 
 
 # --- phase_revise ----------------------------------------------------------------------
