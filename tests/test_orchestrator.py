@@ -1,4 +1,5 @@
 """Orchestrator unit tests + end-to-end pipeline tests with scripted CLIs."""
+import ast
 import json
 import re
 import subprocess
@@ -63,9 +64,35 @@ def test_fenced_commands_do_not_use_claude_tmux_yolo_flag():
 
 # --- helpers -------------------------------------------------------------------
 
+def test_extracted_lifecycle_helpers_are_not_locally_defined():
+    tree = ast.parse(
+        (PROJECT_ROOT / "scripts/adversarial_spec.py").read_text(encoding="utf-8")
+    )
+    local_functions = {
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    extracted = {
+        "_banner", "_write_json", "_ensure_ids", "_unresolved",
+        "_threshold_overrides", "_preflight", "_record_phase",
+        "_log_retrospective", "_phase_failed", "_restore", "_setup_git",
+        "_finish", "_final_md", "_ci_exit_code_from_final", "_positive_int",
+        "_non_negative_int",
+    }
+
+    assert local_functions.isdisjoint(extracted)
+    assert any(
+        isinstance(node, ast.Import)
+        and any(
+            alias.name == "adversarial_common.pipeline_base"
+            for alias in node.names
+        )
+        for node in tree.body
+    )
+
 def test_ensure_ids_fills_and_deduplicates():
     findings = [{"summary": "a"}, {"id": "S1"}, {"id": "S1"}, {"id": ""}]
-    out = orch._ensure_ids(findings)
+    out = orch.pipeline_base.ensure_finding_ids(findings)
     ids = [f["id"] for f in out]
     assert len(ids) == len(set(ids))
     assert all(ids)
@@ -78,13 +105,15 @@ def test_unresolved_keeps_open_findings():
         {"id": "S2", "status": "rejected"},
         {"id": "S3", "status": "disputed"},
     ]
-    assert orch._unresolved(findings, results) == [{"id": "S3"}]
+    assert orch.pipeline_base.unresolved_findings(findings, results) == [
+        {"id": "S3"},
+    ]
 
 
 def test_unresolved_ignores_results_without_id():
     findings = [{"id": "S1"}]
     results = [{"status": "resolved"}]  # no id: must not settle anything
-    assert orch._unresolved(findings, results) == findings
+    assert orch.pipeline_base.unresolved_findings(findings, results) == findings
 
 
 def test_finalize_finding_ids_rekeys_index_warnings():
@@ -111,10 +140,27 @@ def test_finalize_finding_ids_preserves_existing_id_warnings():
 
 def test_positive_int_rejects_zero_and_garbage():
     with pytest.raises(Exception):
-        orch._positive_int("0")
+        orch.pipeline_base.positive_int("0")
     with pytest.raises(Exception):
-        orch._positive_int("nope")
-    assert orch._positive_int("3") == 3
+        orch.pipeline_base.positive_int("nope")
+    assert orch.pipeline_base.positive_int("3") == 3
+
+
+def test_phase_failure_uses_shared_retrospective_record(tmp_path):
+    state = {"feature": "demo", "branch": "spec/demo/1"}
+    result = {"error": "provider crashed", "stdout": "x" * 250}
+
+    code = orch.pipeline_base.phase_failure(
+        "challenge", result, state, tmp_path,
+        policy=orch._SPEC_RETROSPECTIVE_POLICY,
+    )
+
+    assert code == orch.EXIT_INFRA
+    record = (tmp_path / "ISSUES.md").read_text(encoding="utf-8")
+    assert "challenge failed for demo" in record
+    assert "- **Branch:** spec/demo/1" in record
+    assert "- **Error:** provider crashed" in record
+    assert repr("x" * 200) in record
 
 
 def test_finish_merge_failure_returns_infra_and_records_error(
@@ -126,8 +172,10 @@ def test_finish_merge_failure_returns_infra_and_records_error(
     args = orch.build_parser().parse_args([])
     state = {"branch": "spec/demo/1", "parent_branch": "main"}
 
-    code = orch._finish(args, str(tmp_path), "demo", tmp_path, state,
-                        "APPROVED")
+    code = orch.pipeline_base.finish_pipeline(
+        args, str(tmp_path), "demo", tmp_path, state, "APPROVED",
+        policy=orch._spec_finish_policy(args),
+    )
 
     assert code == orch.EXIT_INFRA
     final = json.loads((tmp_path / "final.json").read_text())
@@ -614,6 +662,37 @@ def test_pipeline_restores_dirty_workdir(tmp_path):
     ])
     assert code == orch.EXIT_APPROVED
     assert (workdir / "wip.txt").read_text() == "uncommitted work"
+
+
+def test_pipeline_phase_failure_writes_shared_retrospective(tmp_path):
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    writer = tmp_path / "writer.py"
+    writer.write_text(
+        "import sys\nsys.stdin.read()\n"
+        "print('writer failed', file=sys.stderr)\nraise SystemExit(7)\n"
+    )
+    reviewer = tmp_path / "reviewer.py"
+    reviewer.write_text(APPROVE_REVIEWER)
+    brief = tmp_path / "demo-feature.md"
+    brief.write_text(
+        "# Demo feature\n\nUsers need retrospective failure coverage.\n"
+    )
+
+    code = orch.main([
+        "--brief", str(brief), "--workdir", str(workdir),
+        "--dev-cmd", f"python3 {writer}",
+        "--review-cmd", f"python3 {reviewer}",
+        "--max-loops", "1", "--timeout", "60",
+    ])
+
+    assert code == orch.EXIT_INFRA
+    retrospective = (
+        workdir / ".adversarial-spec" / "demo-feature" / "ISSUES.md"
+    ).read_text(encoding="utf-8")
+    assert "write failed for demo-feature" in retrospective
+    assert "WRITE exited 7" in retrospective
+    assert "Auto-logged by pipeline" in retrospective
 
 
 # --- R1: context gate blocks brief before any provider call -----------------

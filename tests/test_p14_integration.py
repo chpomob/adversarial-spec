@@ -184,20 +184,71 @@ def test_complexity_recorded_in_final_json(tmp_path):
 
 
 def test_complexity_scales_with_brief_size():
-    """_preflight's complexity estimate must grow with brief substance."""
+    """The shared preflight complexity estimate grows with brief substance."""
     args = orch.build_parser().parse_args([])
     small = "Add a login form so users can authenticate into the application today."
-    _, _, small_cx, _, small_ok = orch._preflight(args, small, "/tmp")
+    small_result = orch.pipeline_base.preflight(
+        args, small, "/tmp", policy=orch._spec_preflight_policy(args),
+    )
     big = ("# Big feature\n\n## Requirements\n" +
            "".join(f"- R{n}: requirement number {n} for the system.\n"
                    for n in range(1, 400)))
-    _, _, big_cx, _, big_ok = orch._preflight(args, big, "/tmp")
+    big_result = orch.pipeline_base.preflight(
+        args, big, "/tmp", policy=orch._spec_preflight_policy(args),
+    )
 
-    assert small_ok and big_ok
-    assert small_cx["score"] < big_cx["score"]
-    assert small_cx["recommended_agents"] <= big_cx["recommended_agents"]
+    assert small_result.ok and big_result.ok
+    assert small_result.complexity["score"] < big_result.complexity["score"]
+    assert (small_result.complexity["recommended_agents"]
+            <= big_result.complexity["recommended_agents"])
     tiers = ("trivial", "low", "medium", "high")
-    assert tiers.index(small_cx["level"]) <= tiers.index(big_cx["level"])
+    assert (tiers.index(small_result.complexity["level"])
+            <= tiers.index(big_result.complexity["level"]))
+
+
+def test_restored_stash_state_is_flushed_to_state_json(tmp_path):
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
+    subprocess.run(
+        ["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+        cwd=workdir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"], cwd=workdir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=workdir, check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "Initial commit", "-q"],
+        cwd=workdir, check=True,
+    )
+    (workdir / "wip.txt").write_text("uncommitted work", encoding="utf-8")
+    writer, reviewer = _write_scripts(tmp_path)
+    brief = tmp_path / "brief.md"
+    brief.write_text(
+        "# Demo feature\n\nUsers need restored stash state persistence.\n",
+        encoding="utf-8",
+    )
+
+    code = orch.main([
+        "--brief", str(brief),
+        "--workdir", str(workdir),
+        "--dev-cmd", f"python3 {writer}",
+        "--review-cmd", f"python3 {reviewer}",
+        "--max-loops", "1",
+        "--timeout", "60",
+    ])
+
+    assert code == orch.EXIT_APPROVED
+    assert (workdir / "wip.txt").read_text(encoding="utf-8") == \
+        "uncommitted work"
+    state = json.loads((
+        workdir / ".adversarial-spec" / "brief" / "state.json"
+    ).read_text(encoding="utf-8"))
+    assert state["stash_id"] == ""
 
 
 # --- R8: finding normalization -------------------------------------------------
