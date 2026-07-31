@@ -137,12 +137,13 @@ compatible).
 ## Prompt design
 
 - **NEVER embed the brief or spec text in the challenge prompt.** The challenge
-  prompt tells the model to read the brief and spec from the current directory
-  (set via claude-tmux's `--cwd` flag). Embedding contradicts the adversarial
-  design principle that context lives on disk / in git.
-- The challenge prompt should be under ~2K chars: "Challenge the specification at
-  \`spec.md\` against its brief at \`brief.md\` (both in the current directory).
-  Output ONLY valid JSON: {\"findings\": [...], \"verdict\": \"...\"}"
+  prompt tells the model to read `spec.md` from the phase working directory.
+  It includes only bounded metadata such as the branch-point SHA and output
+  schema; the specification itself remains on disk. Embedding contradicts the
+  adversarial design principle that context lives on disk / in git.
+- Keep the challenge prompt under ~2K chars: "Read and challenge `spec.md` from
+  the current working directory. Inspect the cumulative change from the
+  branch-point SHA. Output ONLY valid JSON."
 - **Fixed 2026-07-15:** `scripts/phases/phase_challenge.py` previously
   concatenated the full spec text into the prompt (`f"--- spec.md ---\n{spec_text}"`)
   despite the SKILL.md saying not to. Patched to an under-1KB instruction with

@@ -167,12 +167,12 @@ def test_challenge_rejects_bad_severity(tmp_path):
 
 def test_challenge_reads_spec_from_disk_without_embedding_it(tmp_path):
     spec_path = tmp_path / "spec.md"
-    short_spec = "UNIQUE_SHORT_SPEC_CONTENT"
+    sentinel = "UNIQUE_SPEC_SENTINEL_CONTENT"
     long_spec = "UNIQUE_LONG_SPEC_CONTENT" * 1_000
     calls = []
     branch_point = "0123456789abcdef"
 
-    spec_path.write_text(short_spec)
+    spec_path.write_text(sentinel)
     phase_challenge.run_challenge(
         "rev", str(tmp_path), 60,
         run=fake_run(stdout=CHALLENGE_OK, calls=calls),
@@ -189,10 +189,11 @@ def test_challenge_reads_spec_from_disk_without_embedding_it(tmp_path):
     assert calls[1]["prompt"] == base_prompt
     assert calls[2]["prompt"].startswith(base_prompt)
     for call in calls:
-        assert short_spec not in call["prompt"]
+        assert sentinel not in call["prompt"]
         assert long_spec not in call["prompt"]
         assert "--- spec.md ---" not in call["prompt"]
         assert "--- current spec.md ---" not in call["prompt"]
+        assert call["cwd"] == str(tmp_path)
         assert branch_point in call["prompt"]
         assert "HEAD~1" not in call["prompt"]
         assert call["role"] == "spec-challenger"

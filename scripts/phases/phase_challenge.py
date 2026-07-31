@@ -48,7 +48,7 @@ def _validate(payload):
 def _build_prompt(branch_point=""):
     diff_base = branch_point or "<branch-point>"
     return (
-        "Challenge the specification at `spec.md` (in the current directory). "
+        "Read and challenge `spec.md` from the current working directory. "
         f"The branch-point SHA is `{diff_base}`. Inspect the cumulative "
         f"change with `git diff {diff_base}..HEAD`.\n"
         "Look for, in priority order: missing requirements, contradictions, "
