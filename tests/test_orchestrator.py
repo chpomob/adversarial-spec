@@ -183,6 +183,28 @@ def test_finish_merge_failure_returns_infra_and_records_error(
     assert "squash merge" in final["error"]
 
 
+def test_verdict_not_approved_on_merge_failure(tmp_path, monkeypatch):
+    def fail_merge(*_args, **_kwargs):
+        raise orch.gitops.GitError("squash merge spec/demo/1 -> main failed: conflict")
+
+    monkeypatch.setattr(orch.gitops, "squash_merge", fail_merge)
+    args = orch.build_parser().parse_args(["--ci"])
+    state = {"branch": "spec/demo/1", "parent_branch": "main"}
+
+    code = orch.pipeline_base.finish_pipeline(
+        args, str(tmp_path), "demo", tmp_path, state, "APPROVED",
+        policy=orch._spec_finish_policy(args),
+    )
+
+    assert code == orch.EXIT_INFRA
+    final = json.loads((tmp_path / "final.json").read_text())
+    assert final["verdict"] != "APPROVED"
+    assert final["verdict"] == "INFRA"
+    assert final["merged"] is False
+    # ponytail: the recorded CI exit code must also reflect infrastructure failure.
+    assert final["ci"]["exit_code"] == orch.EXIT_INFRA
+
+
 # --- CLI parsing ------------------------------------------------------------------
 
 def test_parser_defaults():

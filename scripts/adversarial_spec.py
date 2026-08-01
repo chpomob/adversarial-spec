@@ -206,6 +206,15 @@ def _write_final_with_options(args, out_dir, verdict, payload=None, **extra):
     if payload is not None:
         extra = {**dict(payload), **extra}
     ci_exit_override = extra.pop("_ci_exit_override", None)
+    # ponytail: a failed merge must not be read as APPROVED. pipeline_base
+    # leaves the original verdict string in place and signals failure via the
+    # ``infrastructure`` flag / a ``git finalize failed:`` error, so a CI
+    # consumer reading only ``verdict`` would be misled. Override the written
+    # sentinel here (the same INFRA value this function already treats as
+    # infrastructure) before the CI exit computation and the write.
+    _error_text = str(extra.get("error") or "")
+    if extra.get("infrastructure") or _error_text.startswith("git finalize failed:"):
+        verdict = "INFRA"
     if getattr(args, "html", False):
         extra.setdefault("html_report", str(Path(out_dir) / "report.html"))
     if getattr(args, "ci", False):
