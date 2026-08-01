@@ -32,6 +32,29 @@ def test_skill_provider_defaults_and_context_blocked_exit_are_honest():
     )
 
 
+def test_provider_agnostic_design_doc_does_not_contradict_defaults():
+    """The provider-agnostic-design doc must not claim the two hardcoded
+    legacy defaults were 'removed' while they still live in adversarial_spec.py.
+
+    These literals are an intentional, documented zero-config fallback
+    (legacy provider mode), not an oversight the doc can retroactively erase.
+    """
+    doc = (PROJECT_ROOT / "references" / "provider-agnostic-design.md").read_text(encoding="utf-8")
+
+    removed_section = doc.split("## What was removed", 1)[-1].split("##", 1)[0]
+    for literal in (orch.DEFAULT_DEV_CMD, orch.DEFAULT_REVIEW_CMD):
+        assert literal not in removed_section, (
+            f"'{literal}' still exists in source (adversarial_spec.py) but is "
+            "listed under 'What was removed' in provider-agnostic-design.md. "
+            "Reconcile as the intentional legacy zero-config fallback."
+        )
+
+    # Reconciliation: the doc must acknowledge these defaults are deliberately kept.
+    for literal in (orch.DEFAULT_DEV_CMD, orch.DEFAULT_REVIEW_CMD):
+        assert literal in doc
+    assert "legacy" in doc.casefold()
+
+
 def test_readme_output_example_satisfies_required_frontmatter_fields():
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     match = re.search(r"```yaml\s*\n(?P<example>.*?)```", readme, re.DOTALL)
