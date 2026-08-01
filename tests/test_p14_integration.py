@@ -251,6 +251,71 @@ def test_restored_stash_state_is_flushed_to_state_json(tmp_path):
     assert state["stash_id"] == ""
 
 
+def test_setup_git_partial_failure_leaves_recoverable_state(tmp_path, monkeypatch):
+    """A2: a failure between stashing and branch creation must not orphan the
+    stash. pipeline_base.setup_git records the stash id onto the *shared*
+    state dict the instant `git stash push` succeeds (before branch creation
+    even starts), so a later failure in that same setup_git call still leaves
+    restore_git able to pop the stash back onto the parent branch.
+    """
+    import adversarial_common.gitops as gitops_mod
+
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
+    subprocess.run(
+        ["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+        cwd=workdir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"], cwd=workdir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=workdir, check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "Initial commit", "-q"],
+        cwd=workdir, check=True,
+    )
+    (workdir / "wip.txt").write_text("uncommitted work", encoding="utf-8")
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated branch-creation failure")
+
+    # Stashing (adapter.stash_dirty) runs and succeeds; the very next git
+    # operation in setup_git — branch creation — raises. This forces the
+    # exact partial-failure window between "stash pushed" and "branch made".
+    monkeypatch.setattr(gitops_mod, "create_loop_branch", _boom)
+
+    writer, reviewer = _write_scripts(tmp_path)
+    brief = tmp_path / "brief.md"
+    brief.write_text(
+        "# Demo feature\n\nUsers need partial setup-git failure coverage.\n",
+        encoding="utf-8",
+    )
+
+    code = orch.main([
+        "--brief", str(brief),
+        "--workdir", str(workdir),
+        "--dev-cmd", f"python3 {writer}",
+        "--review-cmd", f"python3 {reviewer}",
+        "--max-loops", "1",
+        "--timeout", "60",
+    ])
+
+    assert code == orch.EXIT_INFRA
+    # The dirty file must be back: restore_git recovered the stash even
+    # though setup_git failed after stashing but before the branch existed.
+    assert (workdir / "wip.txt").read_text(encoding="utf-8") == \
+        "uncommitted work"
+    # No dangling stash entry left behind either.
+    assert subprocess.run(
+        ["git", "stash", "list"], cwd=workdir,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip() == ""
+
+
 # --- R8: finding normalization -------------------------------------------------
 
 def test_challenge_findings_get_epistemic_labels(tmp_path):

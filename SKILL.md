@@ -185,14 +185,14 @@ This means:
 
 ## Known Issues (from 2026-07-14 pre-publication review)
 
-A full adversarial pre-publication review surfaced 20 findings (1 blocker, 8 major, 6 minor, 5 nit). The most critical issues:
+A full adversarial pre-publication review surfaced 20 findings (1 blocker, 8 major, 6 minor, 5 nit). Status below is reconciled against current code and tests; items marked "fixed" carry a test pointer, the rest remain accurate as open issues.
 
-- **Stash loss on setup failure (A1/B2/B3):** If `_setup_git` fails mid-way, the user's stash is lost with no recovery path.
-- **Exit code masks merge failure (A5/B1):** A failed squash-merge still returns exit 0 (APPROVED), misleading CI callers.
-- **Spec validation is too loose (B4):** Only the `name` field is required; specs missing `version`, `author`, `targets`, and `acceptance_criteria` can be approved.
-- **Writer can commit arbitrary changes (B5):** `commit_all` stages everything, not just `spec.md`; a prompt-injected writer could modify source files.
-- **Convergence loop can relitigate settled findings (A2/B6):** Pipeline can exhaust `max_loops` on a REJECT-with-all-settled contradiction from the verifier.
-- **final.json not written on infra failures (A3/B9):** A phase crash leaves a stale `final.json` from a prior run.
-- **Artifact directories overwrite silently (A4):** Reruns of the same feature overwrite prior artifacts.
-- **Custom `--out` paths can be committed (B8):** Only the literal `.adversarial-spec/` is gitignored; relative custom paths get committed.
-- **Issues header stale (A7):** Retrospective file header says failures auto-append there, but they now go to `<out_dir>/ISSUES.md`.
+- **Stash loss on setup failure (A1/B2/B3) — fixed.** `pipeline_base.setup_git` records the stash id onto the shared state the instant `git stash push` succeeds, before branch creation even runs, so a later failure within the same `setup_git` call still leaves `restore_git` able to pop it back onto the parent branch. See `tests/test_p14_integration.py::test_setup_git_partial_failure_leaves_recoverable_state`.
+- **Exit code masks merge failure (A5/B1) — fixed.** A failed squash-merge now forces `EXIT_INFRA` and rewrites the persisted `final.json` verdict to `INFRA`, so a merge failure can never read as `APPROVED`. See `tests/test_orchestrator.py::test_finish_merge_failure_returns_infra_and_records_error` and `::test_verdict_not_approved_on_merge_failure`.
+- **Spec validation is too loose (B4) — fixed.** `phase_spec._REQUIRED_SCALARS` now requires `name`, `version`, and `author`; a non-empty `targets` list (each entry needing `file`/`description`) and full requirement/acceptance-criteria coverage are enforced too. See `tests/test_phases.py::test_validate_spec_missing_name` and `::test_validate_spec_requires_all_frontmatter_fields`.
+- **Writer can commit arbitrary changes (B5):** `commit_all` still stages everything (`git add -A`), not just `spec.md`; a prompt-injected writer could modify source files. Still open.
+- **Convergence loop can relitigate settled findings (A2/B6):** partially mitigated — the REVISE/VERIFY loop no longer overwrites the findings list with an empty set when the verifier REJECTs while marking every finding settled (avoids a crash), but the underlying problem — the pipeline can still burn through `max_loops` re-running the same contradictory REJECT-with-all-settled findings — is unfixed and has no test coverage. Still open.
+- **final.json not written on infra failures (A3/B9):** `pipeline_base.phase_failure` only logs to `ISSUES.md`; it never writes or clears `final.json`, so a stale `final.json` from a prior run survives a phase crash untouched. Still open.
+- **Artifact directories overwrite silently (A4):** Artifact directories are keyed only by feature name, with no timestamp or run id; a rerun of the same feature silently overwrites all prior artifacts. Still open.
+- **Custom `--out` paths can be committed (B8) — fixed.** `_ensure_out_gitignored` anchors a normalized `.gitignore` entry at the nearest tracked ancestor of `--out` before the first commit — covering relative paths, `./`-prefixed paths, paths outside `workdir` but inside the enclosing repo, and paths that resolve to the repo root itself (e.g. `--out .`, where the naive `./` pattern would ignore nothing). See `tests/test_orchestrator.py::test_custom_out_dir_is_gitignored`, `::test_relative_out_with_dot_prefix_is_gitignored`, `::test_outside_workdir_but_inside_repo_is_gitignored`, `::test_custom_out_dot_dir_is_gitignored`, `::test_custom_out_abs_path_inside_repo_is_gitignored`, and `::test_custom_out_abs_repo_root_outside_workdir_is_gitignored`.
+- **Issues header stale (A7) — fixed.** `_retrospective/ISSUES.md`'s header now correctly states that pipeline failures go to `<out_dir>/ISSUES.md`, not this file.

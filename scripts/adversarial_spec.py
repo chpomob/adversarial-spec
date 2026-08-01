@@ -515,7 +515,7 @@ def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
     return None
 
 
-def _ensure_out_gitignored(args, workdir):
+def _ensure_out_gitignored(args, workdir, out_dir):
     """Anchor a ``.gitignore`` entry to the resolved ``--out`` dir.
 
     A ``.gitignore`` governs only its own directory subtree, so the entry is
@@ -523,32 +523,53 @@ def _ensure_out_gitignored(args, workdir):
 
     * inside *workdir* — the common case (default ``.adversarial-spec``, or a
       relative ``--out`` like ``./my-artifacts``) normalized to a pattern git
-      actually matches (``my-artifacts/``, not the inert ``./my-artifacts/``);
+      actually matches and anchors to *workdir* (``/my-artifacts/``, not the
+      inert ``./my-artifacts/`` nor the unanchored ``my-artifacts/``, which
+      would also match same-named directories anywhere below it);
     * elsewhere inside the enclosing repository — at the repo root, because a
       ``workdir/.gitignore`` cannot reach a sibling directory and ``git add -A``
       stages the whole working tree, so the artifacts would otherwise leak;
     * outside the repository — nothing to ignore; git never stages those files,
       and a repo-rooted pattern would only mislead.
 
+    ``args.out`` can itself resolve *to* the anchor directory (``--out .``, or
+    an absolute path equal to *workdir* or the repo root): the naive relative
+    pattern would then be ``""``/``"."``, and a literal ``"./"`` entry ignores
+    nothing (git never matches a ``./`` prefix), leaving every artifact at
+    that root free to be swept into ``commit_all``'s ``git add -A``. In that
+    case *out_dir* — the concrete per-feature directory the pipeline actually
+    writes into (``<out>/<feature>/``) — is a genuine descendant of the anchor,
+    so its relative pattern is used instead.
+
     Runs after :func:`setup_git` (which owns the stash/branch transaction) and
     before the first ``commit_all``, so the entry is in place before any commit.
     """
     workdir_abs = os.path.abspath(workdir)
     abs_out = os.path.normpath(os.path.join(workdir_abs, args.out))
+    out_dir_abs = os.path.abspath(str(out_dir))
 
-    def _within(base):
-        rel = os.path.relpath(abs_out, base)
-        if rel in ("", ".") or rel.startswith("..") or os.path.isabs(rel):
-            return None  # abs_out is not beneath base (or *is* base)
-        return f"{rel}/"
+    def _pattern(target_abs, base):
+        rel = os.path.relpath(target_abs, base)
+        if rel.startswith("..") or os.path.isabs(rel):
+            return None  # target_abs is not beneath base
+        if rel in ("", "."):
+            # target_abs *is* base ("--out ." or an absolute path equal to
+            # base) — fall back to the effective per-feature artifacts dir,
+            # always a real descendant of base.
+            return _pattern(out_dir_abs, base)
+        # Leading "/" anchors the pattern to *base* (the .gitignore's own
+        # directory); without it a slashless single-segment name like
+        # "demo-feature/" would match that directory at any depth, hiding
+        # unrelated paths such as "pkg/demo-feature/".
+        return f"/{rel}/"
 
-    entry = _within(workdir_abs)
+    entry = _pattern(abs_out, workdir_abs)
     target = workdir_abs
     if entry is None:
         root = gitops.detect_enclosing_repo(workdir_abs)
         if root is None:
             return  # no enclosing repo and --out is outside workdir => outside git
-        entry = _within(root)
+        entry = _pattern(abs_out, root)
         target = root
     if entry is not None:
         gitops.ensure_gitignore(target, entry)
@@ -679,7 +700,7 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
     if setup["exit_code"] != 0:
         print(f"X git setup failed: {setup.get('error', 'unknown error')}")
         return EXIT_INFRA
-    _ensure_out_gitignored(args, workdir)
+    _ensure_out_gitignored(args, workdir, out_dir)
     state["feature"] = feature
     pipeline_base.banner(
         f"SPEC BRANCH  {setup['branch']}  (from {setup['parent_branch']})",

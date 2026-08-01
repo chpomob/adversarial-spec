@@ -689,7 +689,7 @@ def test_custom_out_dir_is_gitignored(tmp_path):
         tmp_path, APPROVE_REVIEWER, extra_args=("--out", "my-artifacts"))
     assert code == orch.EXIT_APPROVED
     gitignore = (workdir / ".gitignore").read_text(encoding="utf-8")
-    assert "my-artifacts/" in gitignore.splitlines()
+    assert "/my-artifacts/" in gitignore.splitlines()
     # artifacts really exist under the custom out dir (test is not vacuous)
     assert (workdir / "my-artifacts" / "demo-feature" / "final.json").is_file()
     # git status does not list anything under my-artifacts/ as untracked ...
@@ -707,7 +707,7 @@ def test_default_out_dir_still_gitignored(tmp_path):
     workdir, code = _scripted_pipeline(tmp_path, APPROVE_REVIEWER)
     assert code == orch.EXIT_APPROVED
     gitignore = (workdir / ".gitignore").read_text(encoding="utf-8")
-    assert ".adversarial-spec/" in gitignore.splitlines()
+    assert "/.adversarial-spec/" in gitignore.splitlines()
 
 
 def test_relative_out_with_dot_prefix_is_gitignored(tmp_path):
@@ -718,7 +718,7 @@ def test_relative_out_with_dot_prefix_is_gitignored(tmp_path):
         tmp_path, APPROVE_REVIEWER, extra_args=("--out", "./my-artifacts"))
     assert code == orch.EXIT_APPROVED
     gitignore = (workdir / ".gitignore").read_text(encoding="utf-8")
-    assert "my-artifacts/" in gitignore.splitlines()
+    assert "/my-artifacts/" in gitignore.splitlines()
     assert "./my-artifacts/" not in gitignore.splitlines()
     assert (workdir / "my-artifacts" / "demo-feature" / "final.json").is_file()
     status = _git(workdir, "status", "--porcelain")
@@ -762,7 +762,7 @@ def test_outside_workdir_but_inside_repo_is_gitignored(tmp_path):
     assert (out / "demo-feature" / "final.json").is_file()
     # the entry anchors at the repo root, never workdir
     assert (repo / ".gitignore").is_file()
-    assert "artifacts/" in (repo / ".gitignore").read_text(
+    assert "/artifacts/" in (repo / ".gitignore").read_text(
         encoding="utf-8").splitlines()
     assert not (workdir / ".gitignore").exists()
     # git never tracks the artifacts under any spelling
@@ -770,6 +770,90 @@ def test_outside_workdir_but_inside_repo_is_gitignored(tmp_path):
     assert not any("artifacts" in line for line in status.splitlines()), status
     assert not any("artifacts" in line
                    for line in _git(repo, "ls-files").splitlines())
+
+
+def test_custom_out_dot_dir_is_gitignored(tmp_path):
+    # R2: --out . resolves to workdir itself. The naive relative pattern
+    # would be "./", which git never matches, leaving every artifact at
+    # workdir root free to be swept into commit_all's `git add -A`. The
+    # effective per-feature artifacts dir must be gitignored instead.
+    workdir, code = _scripted_pipeline(
+        tmp_path, APPROVE_REVIEWER, extra_args=("--out", "."))
+    assert code == orch.EXIT_APPROVED
+    gitignore = (workdir / ".gitignore").read_text(encoding="utf-8")
+    assert "./" not in gitignore.splitlines()
+    assert "/demo-feature/" in gitignore.splitlines()
+    # artifacts really exist at the repo root (test is not vacuous)
+    assert (workdir / "demo-feature" / "final.json").is_file()
+    status = _git(workdir, "status", "--porcelain")
+    assert not any("demo-feature/" in line for line in status.splitlines()), status
+    assert not any(line.startswith("demo-feature/")
+                   for line in _git(workdir, "ls-files").splitlines())
+    ignored = _git(workdir, "status", "--ignored", "--porcelain")
+    assert any("demo-feature/" in line for line in ignored.splitlines())
+
+
+def test_custom_out_abs_path_inside_repo_is_gitignored(tmp_path):
+    # R2: an absolute --out that resolves to workdir itself hits the same
+    # "./" trap as --out . and must fall back the same way.
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    writer = tmp_path / "writer.py"
+    writer.write_text(WRITER_SCRIPT.format(spec=VALID_SPEC))
+    reviewer = tmp_path / "reviewer.py"
+    reviewer.write_text(APPROVE_REVIEWER)
+    brief = tmp_path / "demo-feature.md"
+    brief.write_text("# Demo feature\n\nUsers need a demo command.\n")
+    code = orch.main([
+        "--brief", str(brief), "--workdir", str(workdir),
+        "--out", str(workdir),
+        "--dev-cmd", f"python3 {writer}", "--review-cmd", f"python3 {reviewer}",
+        "--max-loops", "1", "--timeout", "60",
+    ])
+    assert code == orch.EXIT_APPROVED
+    gitignore = (workdir / ".gitignore").read_text(encoding="utf-8")
+    assert "/demo-feature/" in gitignore.splitlines()
+    assert (workdir / "demo-feature" / "final.json").is_file()
+    status = _git(workdir, "status", "--porcelain")
+    assert not any("demo-feature/" in line for line in status.splitlines()), status
+
+
+def test_custom_out_abs_repo_root_outside_workdir_is_gitignored(tmp_path):
+    # R2: --out is an absolute path equal to the enclosing repo root, while
+    # workdir is a nested subdirectory. Same "./" trap, but anchored at the
+    # repo root (mirrors test_outside_workdir_but_inside_repo_is_gitignored's
+    # anchoring, exercising the trivial-match fallback there instead of at
+    # workdir).
+    repo = tmp_path
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+                   cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    workdir = repo / "project"
+    workdir.mkdir()
+    writer = workdir / "writer.py"
+    writer.write_text(WRITER_SCRIPT.format(spec=VALID_SPEC))
+    reviewer = workdir / "reviewer.py"
+    reviewer.write_text(APPROVE_REVIEWER)
+    brief = workdir / "demo-feature.md"
+    brief.write_text("# Demo feature\n\nUsers need a demo command.\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+
+    code = orch.main([
+        "--brief", str(brief), "--workdir", str(workdir), "--out", str(repo),
+        "--dev-cmd", f"python3 {writer}", "--review-cmd", f"python3 {reviewer}",
+        "--max-loops", "1", "--timeout", "60",
+    ])
+    assert code == orch.EXIT_APPROVED
+    assert (repo / "demo-feature" / "final.json").is_file()
+    assert (repo / ".gitignore").is_file()
+    assert "/demo-feature/" in (repo / ".gitignore").read_text(
+        encoding="utf-8").splitlines()
+    assert not (workdir / ".gitignore").exists()
+    status = _git(repo, "status", "--porcelain")
+    assert not any("demo-feature/" in line for line in status.splitlines()), status
 
 
 def test_pipeline_restores_dirty_workdir(tmp_path):
