@@ -635,6 +635,98 @@ def test_pipeline_no_merge_keeps_branch(tmp_path):
     assert final["merged"] is False
 
 
+# --- SP4/SP5: gitignore honors --out -----------------------------------------
+
+def test_custom_out_dir_is_gitignored(tmp_path):
+    # --out my-artifacts: .gitignore gains my-artifacts/ before any commit_all,
+    # so the artifacts exist on disk but are never swept into git history.
+    workdir, code = _scripted_pipeline(
+        tmp_path, APPROVE_REVIEWER, extra_args=("--out", "my-artifacts"))
+    assert code == orch.EXIT_APPROVED
+    gitignore = (workdir / ".gitignore").read_text(encoding="utf-8")
+    assert "my-artifacts/" in gitignore.splitlines()
+    # artifacts really exist under the custom out dir (test is not vacuous)
+    assert (workdir / "my-artifacts" / "demo-feature" / "final.json").is_file()
+    # git status does not list anything under my-artifacts/ as untracked ...
+    status = _git(workdir, "status", "--porcelain")
+    assert not any("my-artifacts/" in line for line in status.splitlines()), status
+    # ... and git confirms the path is ignored, not tracked.
+    assert not any(line.startswith("my-artifacts/")
+                   for line in _git(workdir, "ls-files").splitlines())
+    ignored = _git(workdir, "status", "--ignored", "--porcelain")
+    assert any("my-artifacts/" in line for line in ignored.splitlines())
+
+
+def test_default_out_dir_still_gitignored(tmp_path):
+    # Regression guard: the .adversarial-spec default stays protected.
+    workdir, code = _scripted_pipeline(tmp_path, APPROVE_REVIEWER)
+    assert code == orch.EXIT_APPROVED
+    gitignore = (workdir / ".gitignore").read_text(encoding="utf-8")
+    assert ".adversarial-spec/" in gitignore.splitlines()
+
+
+def test_relative_out_with_dot_prefix_is_gitignored(tmp_path):
+    # A1: --out ./my-artifacts must normalize to my-artifacts/ in .gitignore.
+    # The raw ./my-artifacts/ spelling is inert (git never matches a ./ prefix),
+    # so without normalization the artifacts leak into the squashed commit.
+    workdir, code = _scripted_pipeline(
+        tmp_path, APPROVE_REVIEWER, extra_args=("--out", "./my-artifacts"))
+    assert code == orch.EXIT_APPROVED
+    gitignore = (workdir / ".gitignore").read_text(encoding="utf-8")
+    assert "my-artifacts/" in gitignore.splitlines()
+    assert "./my-artifacts/" not in gitignore.splitlines()
+    assert (workdir / "my-artifacts" / "demo-feature" / "final.json").is_file()
+    status = _git(workdir, "status", "--porcelain")
+    assert not any("my-artifacts/" in line for line in status.splitlines()), status
+    assert not any(line.startswith("my-artifacts/")
+                   for line in _git(workdir, "ls-files").splitlines())
+
+
+def test_outside_workdir_but_inside_repo_is_gitignored(tmp_path):
+    # A2: workdir nested inside an enclosing repo; --out lands outside workdir
+    # but inside the repo. A workdir/.gitignore cannot reach a sibling dir, so
+    # the entry must anchor at the repo root or git add -A (whole tree) stages
+    # the artifacts and they leak into the squashed commit.
+    repo = tmp_path
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+                   cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    workdir = repo / "project"
+    workdir.mkdir()
+    writer = workdir / "writer.py"
+    writer.write_text(WRITER_SCRIPT.format(spec=VALID_SPEC))
+    reviewer = workdir / "reviewer.py"
+    reviewer.write_text(APPROVE_REVIEWER)
+    brief = workdir / "demo-feature.md"
+    brief.write_text("# Demo feature\n\nUsers need a demo command.\n")
+    # Commit helpers so the repo tree is clean: setup_git's stash_dirty runs
+    # over the whole enclosing repo and would otherwise sweep them away.
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+
+    out = repo / "artifacts"  # sibling of workdir: outside workdir, inside repo
+    code = orch.main([
+        "--brief", str(brief), "--workdir", str(workdir), "--out", str(out),
+        "--dev-cmd", f"python3 {writer}", "--review-cmd", f"python3 {reviewer}",
+        "--max-loops", "1", "--timeout", "60",
+    ])
+    assert code == orch.EXIT_APPROVED
+    # artifacts really exist under the absolute --out (test is not vacuous)
+    assert (out / "demo-feature" / "final.json").is_file()
+    # the entry anchors at the repo root, never workdir
+    assert (repo / ".gitignore").is_file()
+    assert "artifacts/" in (repo / ".gitignore").read_text(
+        encoding="utf-8").splitlines()
+    assert not (workdir / ".gitignore").exists()
+    # git never tracks the artifacts under any spelling
+    status = _git(repo, "status", "--porcelain")
+    assert not any("artifacts" in line for line in status.splitlines()), status
+    assert not any("artifacts" in line
+                   for line in _git(repo, "ls-files").splitlines())
+
+
 def test_pipeline_restores_dirty_workdir(tmp_path):
     # A dirty file present before the run must be stashed and restored.
     workdir = tmp_path / "project"

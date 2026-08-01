@@ -100,10 +100,6 @@ _THRESHOLD_ENV = {
 
 _FORCE_PROVIDER_ROLES = frozenset({"writer", "challenger", "verify"})
 
-_SPEC_GIT_SETUP_POLICY = pipeline_base.GitSetupPolicy(
-    prefix="spec",
-    gitignore_entry=".adversarial-spec/",
-)
 _SPEC_RESTORE_POLICY = pipeline_base.RestorePolicy()
 _SPEC_RETROSPECTIVE_POLICY = pipeline_base.RetrospectivePolicy(
     infrastructure_exit=EXIT_INFRA,
@@ -510,6 +506,45 @@ def _run_delegated_write(args, brief_text, dev_cmd, workdir, feature,
     return None
 
 
+def _ensure_out_gitignored(args, workdir):
+    """Anchor a ``.gitignore`` entry to the resolved ``--out`` dir.
+
+    A ``.gitignore`` governs only its own directory subtree, so the entry is
+    written to the nearest tracked ancestor of ``--out``:
+
+    * inside *workdir* — the common case (default ``.adversarial-spec``, or a
+      relative ``--out`` like ``./my-artifacts``) normalized to a pattern git
+      actually matches (``my-artifacts/``, not the inert ``./my-artifacts/``);
+    * elsewhere inside the enclosing repository — at the repo root, because a
+      ``workdir/.gitignore`` cannot reach a sibling directory and ``git add -A``
+      stages the whole working tree, so the artifacts would otherwise leak;
+    * outside the repository — nothing to ignore; git never stages those files,
+      and a repo-rooted pattern would only mislead.
+
+    Runs after :func:`setup_git` (which owns the stash/branch transaction) and
+    before the first ``commit_all``, so the entry is in place before any commit.
+    """
+    workdir_abs = os.path.abspath(workdir)
+    abs_out = os.path.normpath(os.path.join(workdir_abs, args.out))
+
+    def _within(base):
+        rel = os.path.relpath(abs_out, base)
+        if rel in ("", ".") or rel.startswith("..") or os.path.isabs(rel):
+            return None  # abs_out is not beneath base (or *is* base)
+        return f"{rel}/"
+
+    entry = _within(workdir_abs)
+    target = workdir_abs
+    if entry is None:
+        root = gitops.detect_enclosing_repo(workdir_abs)
+        if root is None:
+            return  # no enclosing repo and --out is outside workdir => outside git
+        entry = _within(root)
+        target = root
+    if entry is not None:
+        gitops.ensure_gitignore(target, entry)
+
+
 def _spec_preflight_policy(args):
     """Bind spec artifact callbacks to the shared preflight lifecycle."""
     return pipeline_base.PreflightPolicy(
@@ -625,13 +660,17 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
     resolver = getattr(args, "_provider_resolver", None)
 
     # PHASE 0 — GIT SETUP
+    # gitignore_entry=None: _ensure_out_gitignored writes the entry itself,
+    # anchored to workdir or the enclosing repo root as appropriate (R-SP4/5).
     setup = pipeline_base.setup_git(
-        workdir, feature, state, policy=_SPEC_GIT_SETUP_POLICY,
+        workdir, feature, state,
+        policy=pipeline_base.GitSetupPolicy(prefix="spec", gitignore_entry=None),
     )
     state.update(setup)
     if setup["exit_code"] != 0:
         print(f"X git setup failed: {setup.get('error', 'unknown error')}")
         return EXIT_INFRA
+    _ensure_out_gitignored(args, workdir)
     state["feature"] = feature
     pipeline_base.banner(
         f"SPEC BRANCH  {setup['branch']}  (from {setup['parent_branch']})",
