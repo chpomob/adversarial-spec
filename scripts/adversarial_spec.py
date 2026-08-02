@@ -70,6 +70,7 @@ from adversarial_common import (
     jsonio,
     load_provider_config,
     report,
+    run_contract_gate,
     runner,
 )
 import adversarial_common.pipeline_base as pipeline_base
@@ -612,6 +613,34 @@ def _normalize_findings(findings, state=None):
     return findings
 
 
+def _settle_contract_gate(workdir, state):
+    """Run the shared F1 contract gate and return its settle verdict (R1).
+
+    Parses the ``ac-directive`` blocks in ``spec.md`` and executes each one in
+    *workdir* via :func:`adversarial_common.run_contract_gate`. Invoked before
+    a CHALLENGE/VERIFY settle: a failing directive settles ``"REJECT"`` so the
+    run keeps looping and ends REJECT at max-loops. A vacuous spec (no
+    directives) settles ``"APPROVE"``. The full result is recorded on *state*
+    (``state["contract"]``) so it lands in ``final.json`` for auditability.
+
+    Fail-closed: a gate that cannot run (missing spec.md, engine crash)
+    settles ``"REJECT"`` and records a warning — a broken gate never lets a
+    failing spec through to APPROVE.
+    """
+    spec_path = Path(workdir) / "spec.md"
+    try:
+        gate = run_contract_gate(spec_path, workdir)
+    except Exception as exc:  # defensive: fail-closed on engine failure
+        _warn(state, "contract_gate_error",
+              f"contract gate crashed: {type(exc).__name__}: {exc}")
+        gate = {
+            "settle": "REJECT", "ac_status": {}, "failures": [],
+            "directives": [], "error": str(exc),
+        }
+    state["contract"] = gate
+    return gate["settle"]
+
+
 # --- PHASE 0: git setup / finalize ---------------------------------------------
 
 
@@ -661,6 +690,8 @@ def _spec_final_payload(context):
         payload["research_findings"] = state.get("research_findings", [])
     if state.get("delegated") is not None:
         payload["delegated"] = state["delegated"]
+    if state.get("contract") is not None:
+        payload["contract"] = state["contract"]
     return payload
 
 
@@ -764,6 +795,11 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
     # PHASES 3/4 — REVISE / VERIFY loop. An empty findings list only approves
     # when the challenger's verdict is also APPROVE.
     approved = not findings and verdict == "APPROVE"
+    # R1 — invoke the shared contract gate before the CHALLENGE settle. A
+    # failing ac-directive blocks APPROVE here so the run loops and ends REJECT
+    # at max-loops instead of approving an unenforceable spec.
+    if approved and _settle_contract_gate(workdir, state) != "APPROVE":
+        approved = False
     loops_run = 0
     for n in range(1, args.max_loops + 1):
         if approved:
@@ -809,9 +845,18 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
         )
         print(f"  Verdict {verify.get('verdict')} — "
               f"{len(findings) - len(remaining)}/{len(findings)} settled")
-        if verify.get("verdict") == "APPROVE" and results and not remaining:
-            approved = True
-            break
+        if verify.get("verdict") == "APPROVE" and (
+                not findings or (results and not remaining)):
+            # R1 — before the VERIFY settle, the executable contract must also
+            # pass. Findings may all be resolved while an ac-directive still
+            # fails; keep looping (-> REJECT at max-loops) in that case.
+            # A1: when the challenge had no findings, a valid verifier response
+            # has `results: []`; re-run the gate here too so a spec that became
+            # valid during revision can recover instead of rejecting on the
+            # stale initial gate result.
+            if _settle_contract_gate(workdir, state) == "APPROVE":
+                approved = True
+                break
         # Narrow to the still-open findings for the next round; if the verifier
         # rejected overall while marking everything settled (contradiction),
         # keep the current list so the next round sees real content.
