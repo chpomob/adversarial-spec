@@ -50,10 +50,10 @@ Specs are consumed by `adversarial-plan` for planning and `adversarial-code-loop
 ## Quick start
 
 ```bash
-python3 scripts/adversarial_spec.py \
-  --brief "A feature to …" \
-  --dev-cmd "pi --provider zai --model glm-5.2" \
-  --review-cmd "pi --provider deepseek --model deepseek-v4-pro"
+python3 scripts/adversarial_spec.py \\
+  --brief /path/to/brief.md \\
+  --dev-cmd "<your-dev-cmd>" \\
+  --review-cmd "<your-review-cmd>"
 ```
 
 ## Dependencies
