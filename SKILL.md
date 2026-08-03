@@ -3,7 +3,7 @@ name: adversarial-spec
 description: "Adversarial specification writer. Takes a brief (from grill-me or user) and produces a structured spec.md with YAML frontmatter, requirements, acceptance criteria, and target files. Git-aware pipeline: each run on its own branch, squash-merge on approval."
 version: 1.1.0
 author: Hermes Agent
-license: MIT
+license: 0BSD
 platforms: [linux, macos]
 metadata:
   hermes:

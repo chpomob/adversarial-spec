@@ -66,4 +66,4 @@ Uses `adversarial-common` as the shared engine.
 
 ## License
 
-MIT
+0BSD — see [LICENSE](LICENSE).
