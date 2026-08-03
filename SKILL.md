@@ -17,6 +17,18 @@ metadata:
 vague idea (from grill-me or direct input) into a formal spec.md with YAML frontmatter,
 requirements, acceptance criteria, and target file descriptions.
 
+## Installation
+
+Requires the `adversarial-common` sibling repo (shared engine). One-line install:
+
+curl -fsSL https://raw.githubusercontent.com/chpomob/adversarial-spec/main/scripts/install.sh | bash
+
+or, from an existing checkout:
+
+bash scripts/install.sh
+
+Both place adversarial-spec and adversarial-common side by side under `~/.hermes/skills` (override the target with `$1` or `$HERMES_HOME`).
+
 ## Workflow
 
 ```
