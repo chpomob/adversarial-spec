@@ -10,6 +10,7 @@ from adversarial_common import NoProviderAvailable, gitops, run_phase_cmd
 
 from . import (
     enhance_cmd_for_project,
+    merge_runtime,
     provider_history,
     raise_no_provider_available,
     resolve_persona,
@@ -43,6 +44,7 @@ def run_write(
     force_provider=None,
     execution=None,
     ledger=None,
+    max_spec_retries=3,
 ):
     """
     Run the spec-writer with the brief as input, validate, commit.
@@ -50,9 +52,13 @@ def run_write(
     Returns ``{"phase": "write", "exit_code": 0, "commit_sha": "..."}``;
     on failure ``{"phase": "write", "exit_code": 1, "error": "..."}``.
     *run* preserves the legacy injectable execution hook used by unit tests.
+
+    On validation failure, the validator error is fed back to the spec-writer
+    and the write is retried up to *max_spec_retries* times. A valid spec on
+    the first try exits immediately with zero retries.
     """
     try:
-        prompt = (
+        base_prompt = (
             "Write a complete specification for the brief below.\n"
             "Write the file `spec.md` to disk in the current working directory, "
             "with YAML frontmatter (name, version, author, status, tags, targets), "
@@ -60,71 +66,93 @@ def run_write(
             "Do not print the spec body to stdout — write it to disk.\n\n"
             f"Brief:\n\n{brief_text}"
         )
-        if run is not None:
-            result = run(
-                dev_cmd, prompt, "spec-writer", timeout, workdir, phase="write"
-            )
-        else:
-            execution_args = dict(execution or {})
-            if ledger is not None:
-                execution_args["ledger"] = ledger
-            legacy_cmd = enhance_cmd_for_project(dev_cmd, workdir)
-            selected_explicit = (
-                enhance_cmd_for_project(explicit_cmd, workdir)
-                if explicit_cmd is not None else None
-            )
-            command_args = {}
-            if resolver is None and explicit_cmd is None:
-                command_args["cmd"] = legacy_cmd
-            persona_cmd = selected_explicit or (
-                legacy_cmd if resolver is None else ""
-            )
-            result = run_phase_cmd(
-                phase_name="write",
-                role="writer",
-                workdir=workdir,
-                resolver=resolver,
-                explicit_cmd=selected_explicit,
-                force=force,
-                force_provider=force_provider,
-                stdin_text=prompt,
-                timeout=timeout,
-                persona="spec-writer",
-                persona_file=resolve_persona("spec-writer", persona_cmd),
-                **command_args,
-                **execution_args,
-            )
-            raise_no_provider_available(result, "writer")
-        stdout, stderr, code = result[0], result[1], result[2]
-        runtime = runtime_metadata(result)
-        history = provider_history(result)
-        if code != 0:
-            return {
-                "phase": "write",
-                "exit_code": 1,
-                "error": f"WRITE exited {code}: {(stderr or '')[:200]}",
-                "stdout": stdout,
-                "execution": runtime,
-                "provider_history": history,
-            }
-        ok, err = validate_spec_file(workdir)
-        if not ok:
-            return {
-                "phase": "write",
-                "exit_code": 2,
-                "error": f"spec validation failed: {err}",
-                "stdout": stdout,
-                "execution": runtime,
-                "provider_history": history,
-            }
-        gitops.commit_all(workdir, f"write: {feature} — {_short_summary(brief_text)}")
+        prompt = base_prompt
+
+        last_error = None
+        last_stdout = ""
+        prev_runtime = {}
+        all_results = []
+        for attempt in range(1, max_spec_retries + 2):
+            if run is not None:
+                result = run(
+                    dev_cmd, prompt, "spec-writer", timeout, workdir, phase="write"
+                )
+            else:
+                execution_args = dict(execution or {})
+                if ledger is not None:
+                    execution_args["ledger"] = ledger
+                legacy_cmd = enhance_cmd_for_project(dev_cmd, workdir)
+                selected_explicit = (
+                    enhance_cmd_for_project(explicit_cmd, workdir)
+                    if explicit_cmd is not None else None
+                )
+                command_args = {}
+                if resolver is None and explicit_cmd is None:
+                    command_args["cmd"] = legacy_cmd
+                persona_cmd = selected_explicit or (
+                    legacy_cmd if resolver is None else ""
+                )
+                result = run_phase_cmd(
+                    phase_name="write",
+                    role="writer",
+                    workdir=workdir,
+                    resolver=resolver,
+                    explicit_cmd=selected_explicit,
+                    force=force,
+                    force_provider=force_provider,
+                    stdin_text=prompt,
+                    timeout=timeout,
+                    persona="spec-writer",
+                    persona_file=resolve_persona("spec-writer", persona_cmd),
+                    **command_args,
+                    **execution_args,
+                )
+                raise_no_provider_available(result, "writer")
+            stdout, stderr, code = result[0], result[1], result[2]
+            all_results.append(result)
+            prev_runtime = merge_runtime(prev_runtime, runtime_metadata(result))
+            if code != 0:
+                return {
+                    "phase": "write",
+                    "exit_code": 1,
+                    "error": f"WRITE exited {code}: {(stderr or '')[:200]}",
+                    "stdout": stdout,
+                    "execution": prev_runtime,
+                    "provider_history": provider_history(*all_results),
+                }
+            ok, err = validate_spec_file(workdir)
+            if ok:
+                gitops.commit_all(workdir, f"write: {feature} — {_short_summary(brief_text)}")
+                return {
+                    "phase": "write",
+                    "exit_code": 0,
+                    "commit_sha": gitops.head_sha(workdir),
+                    "stdout": stdout,
+                    "execution": prev_runtime,
+                    "provider_history": provider_history(*all_results),
+                }
+            last_error = err
+            last_stdout = stdout
+            if attempt <= max_spec_retries:
+                print(f"  X spec validation failed (attempt {attempt}): {err}")
+                print(f"  -> retrying ({attempt}/{max_spec_retries})...")
+                prompt = (
+                    f"{base_prompt}\n\n"
+                    f"=== CORRECTION FEEDBACK ===\n"
+                    f"Your previous spec.md was rejected by validation:\n"
+                    f"  {err}\n\n"
+                    f"Fix these issues and write the corrected spec.md to disk.\n"
+                    f"Do not print the spec body to stdout — write it to disk."
+                )
+
+        # all retries exhausted
         return {
             "phase": "write",
-            "exit_code": 0,
-            "commit_sha": gitops.head_sha(workdir),
-            "stdout": stdout,
-            "execution": runtime,
-            "provider_history": history,
+            "exit_code": 2,
+            "error": f"spec validation failed after {max_spec_retries + 1} attempts: {last_error}",
+            "stdout": last_stdout,
+            "execution": prev_runtime,
+            "provider_history": provider_history(*all_results),
         }
     except NoProviderAvailable:
         raise

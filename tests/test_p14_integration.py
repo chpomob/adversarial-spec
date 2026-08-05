@@ -140,7 +140,7 @@ def test_input_cap_recorded_with_truncate(tmp_path):
     long_brief = ("# Demo feature\n\n" + "Users need a demo. " * 600)
     code, workdir, final_path = _run_pipeline(
         tmp_path, long_brief,
-        extra_args=("--max-input-chars", "6000", "--truncate-input"))
+        extra_args=("--max-input-chars", "8000", "--truncate-input"))
     assert code == orch.EXIT_APPROVED
     final = json.loads(final_path.read_text())
     cap_events = final["cap_events"]
@@ -149,7 +149,7 @@ def test_input_cap_recorded_with_truncate(tmp_path):
     assert preflight_caps
     assert preflight_caps[0]["kind"] == "input"
     assert preflight_caps[0]["truncated"] is True
-    assert final["execution"]["max_input_chars"] == 6000
+    assert final["execution"]["max_input_chars"] == 8000
 
 
 def test_default_caps_reject_oversized_brief_without_truncate(tmp_path):

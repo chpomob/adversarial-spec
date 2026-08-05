@@ -748,6 +748,7 @@ def _pipeline(args, dev_cmd, review_cmd, workdir, feature, out_dir,
             resolver=resolver,
             execution=execution,
             ledger=ledger,
+            max_spec_retries=args.spec_validation_retries,
             **_provider_call_args(args, "writer", args.dev_cmd),
         )
     pipeline_base.record_phase(state, "write", write, ledger)
@@ -964,6 +965,11 @@ def build_parser():
     p.add_argument(
         "--max-retries", type=pipeline_base.non_negative_int, default=3,
         help="transient retries per provider phase (default: 3)",
+    )
+    p.add_argument(
+        "--spec-validation-retries", type=pipeline_base.non_negative_int,
+        default=3,
+        help="validation retries for spec write (default: 3)",
     )
     p.add_argument(
         "--max-input-chars", type=pipeline_base.non_negative_int,
