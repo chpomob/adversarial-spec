@@ -11,6 +11,8 @@ metadata:
     related_skills: [grill-me, adversarial-plan, adversarial-code-loop]
 ---
 
+Adversarial Spec is a validated specification generator that produces retry-corrected specifications with mandatory R/AC format, checked by two independent models.
+
 # Adversarial Spec
 
 **Brief → structured specification.** Two-role adversarial pipeline that transforms a

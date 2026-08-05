@@ -38,6 +38,13 @@ targets:
 
 Specs are consumed by `adversarial-plan` for planning and `adversarial-code-loop` for implementation.
 
+## Differentiation
+
+- **Two independent models** — writer and challenger are different LLMs; same-model debate is pointless.
+- **Git-native execution** — every run on its own branch, squash-merge on approval, full audit trail.
+- **Full chain** — plan → spec → code → review → verify, integrated with adversarial-plan and adversarial-code-loop.
+- **0BSD license** — no restrictions, use it anywhere.
+
 ## Comparison
 
 | Feature | adversarial-spec | zscole/adversarial-spec |
