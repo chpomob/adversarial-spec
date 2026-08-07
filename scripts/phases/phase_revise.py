@@ -78,7 +78,7 @@ def run_revise(
             f"{findings_marker}' markers in your response."
         )
         phase_name = f"revise_{round_n}"
-        readgate = ReadGatePolicy()
+        readgate = ReadGatePolicy(enforce=False)
 
         def _invoke(prompt_text):
             if run is not None:

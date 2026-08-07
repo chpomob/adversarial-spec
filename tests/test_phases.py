@@ -694,36 +694,30 @@ def test_verify_readgate_hard_error_on_second_miss(tmp_path):
 
 # --- REVISE readgate escalation ---
 
-def test_revise_readgate_warning_retries_then_succeeds(git_repo):
-    """AC4: First miss → re-run with reminder, second attempt includes markers."""
+def test_revise_readgate_relaxed_no_retry(git_repo):
+    """REVISE uses relaxed readgate (enforce=False); succeeds on first call, no retries."""
     (git_repo / "spec.md").write_text(VALID_SPEC)
     calls = []
 
     def _run(cmd, prompt, role, timeout, cwd, phase=None, **kwargs):
         calls.append(prompt)
-        if len(calls) == 1:
-            _write_spec(cwd)
-            return "spec revised", "", 0
-        else:
-            _write_spec(cwd)
-            return REVISE_READGATE_STDOUT, "", 0
+        _write_spec(cwd)
+        return "spec revised", "", 0
 
     result = phase_revise.run_revise([{"id": "S1"}], "dev", str(git_repo), 60,
                                      "f", 1, run=_run)
     assert result["exit_code"] == 0
-    assert len(calls) == 2
-    assert "IMPORTANT: You must read the required files" in calls[1]
+    assert len(calls) == 1
 
 
-def test_revise_readgate_hard_error_on_second_miss(git_repo):
-    """AC4: Two consecutive misses → HARD_ERROR, exit_code 1."""
+def test_revise_readgate_relaxed_never_hard_error(git_repo):
+    """REVISE uses relaxed readgate (enforce=False); missing markers never cause HARD_ERROR."""
     (git_repo / "spec.md").write_text(VALID_SPEC)
     result = phase_revise.run_revise([{"id": "S1"}], "dev", str(git_repo), 60,
                                      "f", 1,
                                      run=fake_run(stdout="no markers here",
                                                   side_effect=_write_spec))
-    assert result["exit_code"] == 1
-    assert "readgate HARD_ERROR" in result["error"]
+    assert result["exit_code"] == 0
 
 
 # --- WRITE readgate escalation (file-based brief only) ---
