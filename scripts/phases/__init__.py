@@ -32,6 +32,7 @@ try:
         runner,
     )
     from adversarial_common.providers import enhance_cmd_for_project, persona_for_role
+    from adversarial_common.readgate import ReadGatePolicy, ReadGateResult
 except ImportError:  # pragma: no cover - exercised only on bare imports
     _COMMON = Path(__file__).resolve().parents[3] / "adversarial-common"
     sys.path.insert(0, str(_COMMON))
@@ -43,6 +44,7 @@ except ImportError:  # pragma: no cover - exercised only on bare imports
         runner,
     )
     from adversarial_common.providers import enhance_cmd_for_project, persona_for_role
+    from adversarial_common.readgate import ReadGatePolicy, ReadGateResult
 from .phase_spec import validate_spec_file, validate_spec_text
 
 __all__ = [
@@ -56,6 +58,8 @@ __all__ = [
     "extract_frontmatter",
     "validate_spec_file",
     "validate_spec_text",
+    "ReadGatePolicy",
+    "ReadGateResult",
 ]
 
 

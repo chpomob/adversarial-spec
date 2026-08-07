@@ -47,6 +47,10 @@ _WRITER = textwrap.dedent("""\
     pathlib.Path("spec.md").write_text(spec)
     pathlib.Path("src").mkdir(exist_ok=True)
     pathlib.Path("src/demo.py").write_text('# demo entry point\\n')
+    # Readgate: include READ markers for files the prompt expects.
+    print("READ: spec.md")
+    print("READ: /tmp/adversarial-spec/revise_findings.json")
+    print("READ: /tmp/adversarial-spec/brief.md")
     print("spec.md written")
 """)
 
@@ -57,6 +61,9 @@ _APPROVE_REVIEWER = textwrap.dedent("""\
     import json, sys
     prompt = sys.stdin.read()
     if "For each finding" in prompt:  # VERIFY round
+        # Readgate: include READ markers before the JSON payload.
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/verify_findings.json")
         print(json.dumps({"results": [], "verdict": "APPROVE"}))
     else:  # CHALLENGE
         print(json.dumps({"findings": [], "verdict": "APPROVE", "summary": "clean"}))
@@ -168,9 +175,15 @@ _WRITER_FIXES_DIRECTIVE = textwrap.dedent("""\
     pathlib.Path("src").mkdir(exist_ok=True)
     # Round 1 (initial write): directive fails — no sentinel yet.
     body = '# demo entry point\\n'
-    if 'Revise the specification' in prompt:
+    if 'Revise `spec.md`' in prompt or 'findings file at' in prompt:
         # Revision: writer fixes the directive by adding the sentinel.
         body = '# demo entry point\\nSENTINEL_PRESENT\\n'
+        # Readgate: include READ markers for the revise phase.
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/revise_findings.json")
+    else:
+        # Write phase: readgate markers (brief may or may not be file-based).
+        print("READ: /tmp/adversarial-spec/brief.md")
     pathlib.Path("src/demo.py").write_text(body)
     print("spec.md written")
 """)

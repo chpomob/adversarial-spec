@@ -285,14 +285,22 @@ def test_main_usage_errors(tmp_path, capsys):
 
 WRITER_SCRIPT = textwrap.dedent("""\
     import pathlib, sys
-    sys.stdin.read()  # consume persona + prompt
+    prompt = sys.stdin.read()
+    if 'findings file at' in prompt:
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/revise_findings.json")
+    elif 'brief from the file' in prompt:
+        print("READ: /tmp/adversarial-spec/brief.md")
     pathlib.Path("spec.md").write_text('''{spec}''')
     print("spec.md written")
 """)
 
 APPROVE_REVIEWER = textwrap.dedent("""\
     import json, sys
-    sys.stdin.read()
+    prompt = sys.stdin.read()
+    if "For each finding" in prompt:
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/verify_findings.json")
     print(json.dumps({"findings": [], "verdict": "APPROVE", "summary": "clean"}))
 """)
 
@@ -301,6 +309,8 @@ REJECT_REVIEWER = textwrap.dedent("""\
     import json, sys
     prompt = sys.stdin.read()
     if "For each finding" in prompt:
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/verify_findings.json")
         print(json.dumps({"results": [{"id": "S1", "status": "disputed"}],
                           "verdict": "REJECT"}))
     else:
@@ -428,6 +438,9 @@ def test_registry_routes_every_delegated_stage_through_writer(tmp_path):
         elif "Draft the specification section" in prompt:
             print("## Delegated section\\n\\nContent for this scope.")
         elif "Merge the delegated spec sections" in prompt:
+            if 'findings file at' in prompt:
+                print("READ: spec.md")
+                print("READ: /tmp/adversarial-spec/revise_findings.json")
             pathlib.Path("spec.md").write_text(%r)
             print("spec.md written")
     """ % VALID_SPEC)
@@ -564,6 +577,8 @@ def test_verify_retry_exhaustion_preserves_first_decision_in_final(tmp_path):
         prompt = sys.stdin.read()
         if "For each finding" in prompt:
             pathlib.Path({str(marker)!r}).write_text("done")
+            print("READ: spec.md")
+            print("READ: /tmp/adversarial-spec/verify_findings.json")
             print("invalid JSON")
         else:
             print(json.dumps({{
@@ -1000,6 +1015,8 @@ FINDINGS_REVIEWER = textwrap.dedent("""\
     import json, sys
     prompt = sys.stdin.read()
     if "For each finding" in prompt:
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/verify_findings.json")
         print(json.dumps({
             "results": [{"id": "S1", "status": "resolved"}],
             "verdict": "APPROVE"

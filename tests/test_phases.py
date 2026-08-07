@@ -201,10 +201,17 @@ def test_challenge_reads_spec_from_disk_without_embedding_it(tmp_path):
 
 # --- phase_revise ----------------------------------------------------------------------
 
+REVISE_READGATE_STDOUT = (
+    "READ: spec.md\n"
+    "READ: /tmp/adversarial-spec/revise_findings.json\n"
+    "revised spec.md"
+)
+
+
 def test_revise_success_commits_round(git_repo):
     (git_repo / "spec.md").write_text(VALID_SPEC)
     findings = [{"id": "S1", "summary": "fix me"}]
-    run = fake_run(side_effect=_write_spec)
+    run = fake_run(stdout=REVISE_READGATE_STDOUT, side_effect=_write_spec)
     result = phase_revise.run_revise(findings, "dev", str(git_repo), 60,
                                      "my-feat", 2, run=run)
     assert result["exit_code"] == 0
@@ -214,10 +221,14 @@ def test_revise_success_commits_round(git_repo):
 def test_revise_findings_in_prompt(git_repo):
     (git_repo / "spec.md").write_text(VALID_SPEC)
     calls = []
-    phase_revise.run_revise([{"id": "S9", "summary": "oops"}], "dev",
+    findings = [{"id": "S9", "summary": "oops"}]
+    phase_revise.run_revise(findings, "dev",
                             str(git_repo), 60, "f", 1,
-                            run=fake_run(side_effect=_write_spec, calls=calls))
-    assert "S9" in calls[0]["prompt"]
+                            run=fake_run(stdout=REVISE_READGATE_STDOUT,
+                                         side_effect=_write_spec, calls=calls))
+    # R3: prompt carries file path, not embedded findings body.
+    assert "S9" not in calls[0]["prompt"]
+    assert "revise_findings.json" in calls[0]["prompt"]
     assert calls[0]["role"] == "spec-writer"
 
 
@@ -225,7 +236,8 @@ def test_revise_broken_spec_fails_validation(git_repo):
     def _break_spec(cwd):
         (Path(cwd) / "spec.md").write_text("no frontmatter anymore")
     result = phase_revise.run_revise([], "dev", str(git_repo), 60, "f", 1,
-                                     run=fake_run(side_effect=_break_spec))
+                                     run=fake_run(stdout=REVISE_READGATE_STDOUT,
+                                                  side_effect=_break_spec))
     assert result["exit_code"] == 1
     assert "spec validation failed" in result["error"]
 
@@ -237,11 +249,19 @@ VERIFY_OK = json.dumps({
     "verdict": "APPROVE",
 })
 
+VERIFY_READGATE_STDOUT = (
+    "READ: spec.md\n"
+    "READ: /tmp/adversarial-spec/verify_findings.json\n"
+)
+
+# VERIFY_OK with READ markers (for tests where readgate must pass)
+VERIFY_OK_RG = VERIFY_READGATE_STDOUT + "\n" + VERIFY_OK
+
 
 def test_verify_parses_results(tmp_path):
     (tmp_path / "spec.md").write_text(VALID_SPEC)
     result = phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
-                                     run=fake_run(stdout=VERIFY_OK))
+                                     run=fake_run(stdout=VERIFY_OK_RG))
     assert result["exit_code"] == 0
     assert result["verdict"] == "APPROVE"
     assert result["results"][0]["status"] == "resolved"
@@ -253,7 +273,7 @@ def test_verify_prompt_uses_branch_point(tmp_path):
     branch_point = "fedcba9876543210"
     phase_verify.run_verify(
         [{"id": "S1"}], "rev", str(tmp_path), 60,
-        run=fake_run(stdout=VERIFY_OK, calls=calls),
+        run=fake_run(stdout=VERIFY_OK_RG, calls=calls),
         branch_point=branch_point)
     assert branch_point in calls[0]["prompt"]
     assert "HEAD~1" not in calls[0]["prompt"]
@@ -261,8 +281,9 @@ def test_verify_prompt_uses_branch_point(tmp_path):
 
 def test_verify_invalid_status_rejected(tmp_path):
     (tmp_path / "spec.md").write_text(VALID_SPEC)
-    bad = json.dumps({"results": [{"id": "S1", "status": "maybe"}],
-                      "verdict": "APPROVE"})
+    bad = VERIFY_READGATE_STDOUT + "\n" + json.dumps(
+        {"results": [{"id": "S1", "status": "maybe"}],
+         "verdict": "APPROVE"})
     result = phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
                                      run=fake_run(stdout=bad))
     assert result["exit_code"] == 1
@@ -270,7 +291,7 @@ def test_verify_invalid_status_rejected(tmp_path):
 
 def test_verify_fenced_json_accepted(tmp_path):
     (tmp_path / "spec.md").write_text(VALID_SPEC)
-    fenced = f"```json\n{VERIFY_OK}\n```"
+    fenced = f"{VERIFY_READGATE_STDOUT}\n```json\n{VERIFY_OK}\n```"
     result = phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
                                      run=fake_run(stdout=fenced))
     assert result["exit_code"] == 0
@@ -372,7 +393,10 @@ def test_verify_retry_accumulates_attempt_metadata(tmp_path):
 
     def _run(cmd, prompt, role, timeout, cwd, phase=None, **kwargs):
         calls.append(prompt)
-        out = "garbage" if len(calls) == 1 else VERIFY_OK
+        if len(calls) == 1:
+            out = "READ: spec.md\nREAD: /tmp/adversarial-spec/verify_findings.json\ngarbage"
+        else:
+            out = VERIFY_OK_RG
         return _result_with_metadata(
             out, "", 0, {"attempts": [{"attempt": len(calls)}]})
 
@@ -444,7 +468,8 @@ def test_revise_tags_cost_phase_with_round(git_repo):
     (git_repo / "spec.md").write_text(VALID_SPEC)
     calls = []
     phase_revise.run_revise([{"id": "S1"}], "dev", str(git_repo), 60, "f", 2,
-                            run=fake_run(side_effect=_write_spec, calls=calls))
+                            run=fake_run(stdout=REVISE_READGATE_STDOUT,
+                                         side_effect=_write_spec, calls=calls))
     assert calls[0]["phase"] == "revise_2"
 
 
@@ -452,7 +477,7 @@ def test_verify_tags_cost_phase_with_round(tmp_path):
     (tmp_path / "spec.md").write_text(VALID_SPEC)
     calls = []
     phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
-                            run=fake_run(stdout=VERIFY_OK, calls=calls),
+                            run=fake_run(stdout=VERIFY_OK_RG, calls=calls),
                             round_n=3)
     assert calls[0]["phase"] == "verify_3"
 
@@ -461,7 +486,7 @@ def test_verify_phase_defaults_without_round(tmp_path):
     (tmp_path / "spec.md").write_text(VALID_SPEC)
     calls = []
     phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
-                            run=fake_run(stdout=VERIFY_OK, calls=calls))
+                            run=fake_run(stdout=VERIFY_OK_RG, calls=calls))
     assert calls[0]["phase"] == "verify"
 
 
@@ -550,3 +575,167 @@ def test_estimate_complexity_levels():
     high = gates.estimate_complexity("x" * 10000 + "\nR1: req\n" * 50)
     assert high["level"] == "high"
     assert high["recommended_agents"] == 6
+
+
+# === AC1 (R1): VERIFY prompt carries file paths, not embedded payloads ======
+
+def test_verify_prompt_has_no_embedded_spec_text(tmp_path):
+    """AC1: VERIFY prompt does not embed spec.md content."""
+    sentinel = "UNIQUE_VERIFY_SENTINEL_XYZ123"
+    (tmp_path / "spec.md").write_text(sentinel)
+    calls = []
+    phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
+                            run=fake_run(stdout=VERIFY_OK_RG, calls=calls))
+    prompt = calls[0]["prompt"]
+    assert sentinel not in prompt
+    assert "READ: spec.md" in prompt
+    assert "verify_findings.json" in prompt
+
+
+def test_verify_prompt_has_no_embedded_findings_body(tmp_path):
+    """AC1: VERIFY prompt does not embed findings JSON body."""
+    (tmp_path / "spec.md").write_text(VALID_SPEC)
+    findings = [{"id": "XYZSPECIAL", "summary": "unique finding body"}]
+    calls = []
+    phase_verify.run_verify(findings, "rev", str(tmp_path), 60,
+                            run=fake_run(stdout=VERIFY_OK_RG, calls=calls))
+    prompt = calls[0]["prompt"]
+    assert "XYZSPECIAL" not in prompt
+    assert "verify_findings.json" in prompt
+
+
+# === AC3 (R3): REVISE prompt carries file path, not findings body =============
+
+def test_revise_prompt_has_no_embedded_findings_body(git_repo):
+    """AC3: REVISE prompt references findings file path, not embedded JSON."""
+    (git_repo / "spec.md").write_text(VALID_SPEC)
+    findings = [{"id": "UNIQUE_REVISE_ID", "summary": "unique revise body"}]
+    calls = []
+    phase_revise.run_revise(findings, "dev", str(git_repo), 60, "f", 1,
+                            run=fake_run(stdout=REVISE_READGATE_STDOUT,
+                                         side_effect=_write_spec, calls=calls))
+    prompt = calls[0]["prompt"]
+    assert "UNIQUE_REVISE_ID" not in prompt
+    assert "revise_findings.json" in prompt
+
+
+# === AC2 (R2): WRITE uses file-based brief when over threshold ===============
+
+def test_write_file_based_brief_over_threshold(git_repo):
+    """AC2: Brief > 2000 bytes is written to disk, prompt carries file path."""
+    # Build a brief that's > 2000 UTF-8 bytes.
+    large_brief = ("# Large Feature\n\n"
+                   + "R1: a very detailed requirement. " * 200)
+    assert len(large_brief.encode("utf-8")) > 2000
+    calls = []
+    result = phase_write.run_write(large_brief, "dev", str(git_repo), 60,
+                                   "big-feat",
+                                   run=fake_run(stdout="READ: /tmp/adversarial-spec/brief.md\nspec written",
+                                                side_effect=_write_spec,
+                                                calls=calls))
+    prompt = calls[0]["prompt"]
+    assert "brief.md" in prompt
+    # The large brief body must not be embedded.
+    assert large_brief not in prompt
+
+
+def test_write_inline_brief_under_threshold(git_repo):
+    """AC2: Brief <= 2000 bytes may remain inline."""
+    small_brief = "# Small\n\nOne line."
+    assert len(small_brief.encode("utf-8")) <= 2000
+    calls = []
+    phase_write.run_write(small_brief, "dev", str(git_repo), 60, "small",
+                          run=fake_run(side_effect=_write_spec, calls=calls))
+    prompt = calls[0]["prompt"]
+    assert "Brief:" in prompt
+    assert small_brief in prompt
+
+
+# === AC4 (R4): ReadGate escalation (WARNING → re-run, HARD_ERROR on second miss)
+
+# --- VERIFY readgate escalation ---
+
+def test_verify_readgate_warning_retries_then_succeeds(tmp_path):
+    """AC4: First miss → re-run with reminder, second attempt includes markers."""
+    (tmp_path / "spec.md").write_text(VALID_SPEC)
+    calls = []
+
+    def _run(cmd, prompt, role, timeout, cwd, phase=None, **kwargs):
+        calls.append(prompt)
+        if len(calls) == 1:
+            # First attempt: valid JSON but no READ markers.
+            return VERIFY_OK, "", 0
+        else:
+            # Second attempt (after readgate reminder): includes markers.
+            return VERIFY_OK_RG, "", 0
+
+    result = phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
+                                     run=_run)
+    assert result["exit_code"] == 0
+    assert len(calls) == 2
+    assert "IMPORTANT: You must read the required files" in calls[1]
+
+
+def test_verify_readgate_hard_error_on_second_miss(tmp_path):
+    """AC4: Two consecutive misses → HARD_ERROR, exit_code 1."""
+    (tmp_path / "spec.md").write_text(VALID_SPEC)
+    calls = []
+
+    def _run(cmd, prompt, role, timeout, cwd, phase=None, **kwargs):
+        calls.append(prompt)
+        return VERIFY_OK, "", 0  # valid JSON, never includes READ markers
+
+    result = phase_verify.run_verify([{"id": "S1"}], "rev", str(tmp_path), 60,
+                                     run=_run)
+    assert result["exit_code"] == 1
+    assert "readgate HARD_ERROR" in result["error"]
+    assert len(calls) == 2
+
+
+# --- REVISE readgate escalation ---
+
+def test_revise_readgate_warning_retries_then_succeeds(git_repo):
+    """AC4: First miss → re-run with reminder, second attempt includes markers."""
+    (git_repo / "spec.md").write_text(VALID_SPEC)
+    calls = []
+
+    def _run(cmd, prompt, role, timeout, cwd, phase=None, **kwargs):
+        calls.append(prompt)
+        if len(calls) == 1:
+            _write_spec(cwd)
+            return "spec revised", "", 0
+        else:
+            _write_spec(cwd)
+            return REVISE_READGATE_STDOUT, "", 0
+
+    result = phase_revise.run_revise([{"id": "S1"}], "dev", str(git_repo), 60,
+                                     "f", 1, run=_run)
+    assert result["exit_code"] == 0
+    assert len(calls) == 2
+    assert "IMPORTANT: You must read the required files" in calls[1]
+
+
+def test_revise_readgate_hard_error_on_second_miss(git_repo):
+    """AC4: Two consecutive misses → HARD_ERROR, exit_code 1."""
+    (git_repo / "spec.md").write_text(VALID_SPEC)
+    result = phase_revise.run_revise([{"id": "S1"}], "dev", str(git_repo), 60,
+                                     "f", 1,
+                                     run=fake_run(stdout="no markers here",
+                                                  side_effect=_write_spec))
+    assert result["exit_code"] == 1
+    assert "readgate HARD_ERROR" in result["error"]
+
+
+# --- WRITE readgate escalation (file-based brief only) ---
+
+def test_write_file_based_readgate_hard_error(git_repo):
+    """AC4: File-based brief, two misses → HARD_ERROR."""
+    large_brief = ("# Large Feature\n\n"
+                   + "R1: a very detailed requirement. " * 200)
+    assert len(large_brief.encode("utf-8")) > 2000
+    result = phase_write.run_write(large_brief, "dev", str(git_repo), 60,
+                                   "big-feat",
+                                   run=fake_run(stdout="no marker",
+                                                side_effect=_write_spec))
+    assert result["exit_code"] == 1
+    assert "readgate HARD_ERROR" in result["error"]

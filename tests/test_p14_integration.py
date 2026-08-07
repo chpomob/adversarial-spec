@@ -13,14 +13,24 @@ from scripts import adversarial_spec as orch
 
 WRITER_SCRIPT = textwrap.dedent("""\
     import pathlib, sys
-    sys.stdin.read()  # consume persona + prompt
+    prompt = sys.stdin.read()
+    # Readgate: include READ markers when in revise mode (prompt mentions findings file).
+    if 'findings file at' in prompt:
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/revise_findings.json")
+    elif 'brief from the file' in prompt:
+        print("READ: /tmp/adversarial-spec/brief.md")
     pathlib.Path("spec.md").write_text('''{spec}''')
     print("spec.md written")
 """)
 
 APPROVE_REVIEWER = textwrap.dedent("""\
     import json, sys
-    sys.stdin.read()
+    prompt = sys.stdin.read()
+    if "For each finding" in prompt:
+        # VERIFY: include readgate markers.
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/verify_findings.json")
     print(json.dumps({"findings": [], "verdict": "APPROVE", "summary": "clean"}))
 """)
 
@@ -348,6 +358,8 @@ def test_challenge_findings_get_epistemic_labels(tmp_path):
         import json, sys
         prompt = sys.stdin.read()
         if "For each finding" in prompt:
+            print("READ: spec.md")
+            print("READ: /tmp/adversarial-spec/verify_findings.json")
             print(json.dumps({"results": [{"id": "S1", "status": "disputed"}],
                               "verdict": "REJECT"}))
         else:

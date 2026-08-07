@@ -12,14 +12,22 @@ from scripts import adversarial_spec as orch
 
 WRITER_SCRIPT = textwrap.dedent("""\
     import pathlib, sys
-    sys.stdin.read()  # consume persona + prompt
+    prompt = sys.stdin.read()
+    if 'findings file at' in prompt:
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/revise_findings.json")
+    elif 'brief from the file' in prompt:
+        print("READ: /tmp/adversarial-spec/brief.md")
     pathlib.Path("spec.md").write_text('''{spec}''')
     print("spec.md written")
 """)
 
 APPROVE_REVIEWER = textwrap.dedent("""\
     import json, sys
-    sys.stdin.read()
+    prompt = sys.stdin.read()
+    if "For each finding" in prompt:
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/verify_findings.json")
     print(json.dumps({"findings": [], "verdict": "APPROVE", "summary": "clean"}))
 """)
 
@@ -31,6 +39,8 @@ HOSTILE_REVIEWER = textwrap.dedent("""\
     prompt = sys.stdin.read()
     hostile = \"<script title='x'>&'</script></details>\"
     if \"For each finding\" in prompt:
+        print("READ: spec.md")
+        print("READ: /tmp/adversarial-spec/verify_findings.json")
         print(json.dumps({\"results\": [{\"id\": \"X1\", \"status\": \"disputed\"}],
                           \"verdict\": \"REJECT\"}))
     else:
@@ -56,9 +66,17 @@ BRANCHING_WRITER = textwrap.dedent("""\
     elif "Draft the specification section" in prompt:
         print("## Drafted section\\n\\nContent for the delegated scope.")
     elif "Merge the delegated spec sections" in prompt:
+        if 'findings file at' in prompt:
+            print("READ: spec.md")
+            print("READ: /tmp/adversarial-spec/revise_findings.json")
         pathlib.Path("spec.md").write_text('''__SPEC__''')
         print("spec.md written (delegated)")
     else:
+        if 'findings file at' in prompt:
+            print("READ: spec.md")
+            print("READ: /tmp/adversarial-spec/revise_findings.json")
+        elif 'brief from the file' in prompt:
+            print("READ: /tmp/adversarial-spec/brief.md")
         pathlib.Path("spec.md").write_text('''__SPEC__''')
         print("spec.md written")
 """)

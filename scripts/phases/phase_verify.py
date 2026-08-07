@@ -1,17 +1,21 @@
 """
 VERIFY phase: the spec-challenger checks whether findings are resolved.
 
-The revised ``spec.md`` and the findings are embedded in the prompt; the
-model marks each finding resolved / rejected / disputed and gives an overall
-APPROVE/REJECT verdict. JSON extraction uses the shared 3-strategy parser;
-one retry with a stricter instruction on invalid JSON.
+The findings are written to a JSON file on disk (outside the workdir). The
+prompt directs the model to read ``spec.md`` from the workdir and the
+findings file via READ markers; no payload is embedded.  JSON extraction
+uses the shared 3-strategy parser; one retry with a stricter instruction on
+invalid JSON.  A ReadGatePolicy enforces proof-of-read with WARNING →
+HARD_ERROR escalation.
 """
 import json
+import tempfile
 from pathlib import Path
 
 from adversarial_common import NoProviderAvailable, run_phase_cmd
 
 from . import (
+    ReadGatePolicy,
     enhance_cmd_for_project,
     merge_runtime,
     provider_history,
@@ -25,6 +29,17 @@ __all__ = ["run_verify"]
 
 _VALID_VERDICTS = {"APPROVE", "REJECT"}
 _VALID_STATUS = {"resolved", "rejected", "disputed"}
+
+def _verify_tmpdir():
+    """Create a unique temp dir per run (avoids symlink races and cross-run collisions)."""
+    return Path(tempfile.mkdtemp(prefix="adversarial-spec-verify-"))
+
+_READGATE_REMINDER = (
+    "\n\nIMPORTANT: You must read the required files from disk before "
+    "responding. Include 'READ: <path>' markers in your output to confirm "
+    "you read each file. For example: 'READ: spec.md' or "
+    "'READ: /tmp/adversarial-spec/verify_findings.json'"
+)
 
 
 def _validate(payload):
@@ -70,29 +85,54 @@ def run_verify(
     """
     verify_phase = f"verify_{round_n}" if round_n else "verify"
     try:
-        spec_text = (Path(workdir) / "spec.md").read_text(encoding="utf-8")
+        # Verify spec.md exists (model reads it from disk, so we only
+        # check availability — content is never embedded).
+        (Path(workdir) / "spec.md").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return {"phase": "verify", "exit_code": 1,
                 "error": f"could not read spec.md: {exc}"}
 
+    # Write findings to a temp file outside the workdir.
+    findings_dir = _verify_tmpdir()
+    findings_path = findings_dir / "verify_findings.json"
+    findings_path.write_text(json.dumps(findings, indent=2), encoding="utf-8")
+
     diff_base = branch_point or "<branch-point>"
+    spec_marker = "spec.md"
+    findings_marker = str(findings_path)
     prompt = (
-        "The specification `spec.md` was revised to address the findings "
-        "below. For each finding, decide whether it is **resolved** (the spec "
-        "now addresses it), **rejected** (the finding was wrong), or "
-        "**disputed** (still open / unclear). You may also run "
-        "the cumulative diff in the current directory with "
-        f"`git diff {diff_base}..HEAD` to see the exact "
-        "revision.\n\n"
-        f"Findings:\n{json.dumps(findings, indent=2)}\n\n"
+        "Read `spec.md` from the current working directory and the findings "
+        f"file at `{findings_marker}`.\n\n"
+        "The spec was revised to address the findings. For each finding, "
+        "decide whether it is **resolved** (the spec now addresses it), "
+        "**rejected** (the finding was wrong), or **disputed** (still open "
+        "/ unclear). You may also run the cumulative diff with "
+        f"`git diff {diff_base}..HEAD`.\n\n"
+        "Include 'READ: spec.md' and 'READ: "
+        f"{findings_marker}' markers in your response.\n\n"
         "Output ONLY valid JSON:\n"
         '{"results": [{"id": "S1", "status": "resolved|rejected|disputed", '
-        '"note": "optional"}], "verdict": "APPROVE|REJECT"}\n\n'
-        f"--- revised spec.md ---\n{spec_text}"
+        '"note": "optional"}], "verdict": "APPROVE|REJECT"}'
     )
     provider_results = []
+    readgate = ReadGatePolicy()
+    readgate_retried = False
 
-    def _attempt(prompt_text):
+    def _check_readgate(stdout):
+        """Check stdout for READ markers on both required files."""
+        r1 = readgate.check(stdout, spec_marker)
+        r2 = readgate.check(stdout, findings_marker)
+        # Return the worst status and the list of paths that missed.
+        statuses = ["pass", "WARNING", "HARD_ERROR"]
+        worst = max(r1.status, r2.status, key=lambda s: statuses.index(s))
+        missing = []
+        if r1.status != "pass":
+            missing.append(spec_marker)
+        if r2.status != "pass":
+            missing.append(findings_marker)
+        return worst, missing
+
+    def _attempt(prompt_text, check_readgate=True):
         if run is not None:
             result = run(
                 review_cmd, prompt_text, "spec-challenger", timeout, workdir,
@@ -134,21 +174,49 @@ def run_verify(
             )
         stdout, stderr, code = result[0], result[1], result[2]
         if code != 0:
-            return None, f"VERIFY exited {code}: {(stderr or '')[:200]}", stdout, runtime_metadata(result)
-        return try_parse_json(stdout), None, stdout, runtime_metadata(result)
+            return None, f"VERIFY exited {code}: {(stderr or '')[:200]}", stdout, runtime_metadata(result), "pass"
+        payload = try_parse_json(stdout)
+        if check_readgate:
+            rg_status, _rg_missing = _check_readgate(stdout)
+        else:
+            rg_status = "pass"
+        return payload, None, stdout, runtime_metadata(result), rg_status
 
     try:
-        payload, err, stdout, runtime = _attempt(prompt)
+        payload, err, stdout, runtime, rg_status = _attempt(prompt)
+        if rg_status == "HARD_ERROR":
+            return {"phase": "verify", "exit_code": 1,
+                    "error": "readgate HARD_ERROR: missing READ markers on "
+                            "consecutive attempts",
+                    "stdout": stdout, "execution": runtime,
+                    "provider_history": provider_history(*provider_results)}
+        if rg_status == "WARNING":
+            readgate_retried = True
+            prev_runtime = runtime
+            payload, err, stdout, runtime, rg_status = _attempt(
+                prompt + _READGATE_REMINDER
+            )
+            runtime = merge_runtime(prev_runtime, runtime)
+            if rg_status == "HARD_ERROR":
+                return {"phase": "verify", "exit_code": 1,
+                        "error": "readgate HARD_ERROR: missing READ markers "
+                                "after retry",
+                        "stdout": stdout, "execution": runtime,
+                        "provider_history": provider_history(*provider_results)}
         if err:
             return {"phase": "verify", "exit_code": 1, "error": err,
                     "stdout": stdout, "execution": runtime,
                     "provider_history": provider_history(*provider_results)}
         if not _validate(payload):
             prev_runtime = runtime
-            payload, err, stdout, runtime = _attempt(
-                prompt + "\n\nIMPORTANT: Respond with raw JSON only. "
-                         "No markdown, no code fences, no explanations."
+            retry_prompt = (
+                prompt
+                + ("" if not readgate_retried else _READGATE_REMINDER)
+                + "\n\nIMPORTANT: Respond with raw JSON only. "
+                  "No markdown, no code fences, no explanations."
             )
+            payload, err, stdout, runtime, _rg = _attempt(retry_prompt,
+                                                          check_readgate=False)
             runtime = merge_runtime(prev_runtime, runtime)
             if err:
                 return {"phase": "verify", "exit_code": 1, "error": err,
