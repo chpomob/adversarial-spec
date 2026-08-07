@@ -5,3 +5,4 @@ __pycache__/
 
 .venv/
 *.py[cod]
+.adversarial-plan/
